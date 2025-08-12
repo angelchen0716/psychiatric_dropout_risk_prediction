@@ -449,10 +449,10 @@ elif level == "Low–Moderate":
 else:
     st.success("🟢 Low Risk")
 
-# ====== SHAP + Policy drivers + 對齊卡 ======
+# ====== SHAP + Policy drivers + 對齊卡（含 waterfall 圖） ======
 with st.expander("🔍 Explanations — Model SHAP vs Policy drivers", expanded=True):
-    # SHAP（model-only）
     import xgboost as xgb
+    # 1) 取得單例 SHAP（優先用 pred_contribs）
     try:
         booster = model.get_booster()
         dmat = xgb.DMatrix(X_align, feature_names=list(X_align.columns))
@@ -469,57 +469,68 @@ with st.expander("🔍 Explanations — Model SHAP vs Policy drivers", expanded=
             if isinstance(sv_raw, list): sv_raw = sv_raw[0]
         sv_map = dict(zip(list(X_align.columns), sv_raw[0]))
 
-    # 整理單例 SHAP（只顯示作用中的 one-hot）
+    # 2) 建立可視化資料（同時給 waterfall 與表格使用）
     feat_rows = []
     def _push_shap(label, key, shown_value):
         if key in sv_map:
-            feat_rows.append({
-                "feature": label, "value": shown_value,
-                "model_shap": float(sv_map[key])
-            })
-    # 連續變數
+            feat_rows.append({"feature": label, "value": shown_value, "model_shap": float(sv_map[key]), "key": key})
+
+    # 連續特徵
     _push_shap("Age", "age", X_used.at[0,"age"])
     _push_shap("Length of Stay", "length_of_stay", X_used.at[0,"length_of_stay"])
     _push_shap("Previous Admissions", "num_previous_admissions", X_used.at[0,"num_previous_admissions"])
     _push_shap("Medication Compliance", "medication_compliance_score", X_used.at[0,"medication_compliance_score"])
     _push_shap("Family Support", "family_support_score", X_used.at[0,"family_support_score"])
     _push_shap("Post-discharge Followups", "post_discharge_followups", X_used.at[0,"post_discharge_followups"])
-    # 一熱
-    for dx in diagnoses:
-        _push_shap(f"Diagnosis={dx}", f"diagnosis_{dx}", 1)
+    # 一熱特徵（僅顯示被選中的）
+    for dx in diagnoses: _push_shap(f"Diagnosis={dx}", f"diagnosis_{dx}", 1)
     _push_shap(f"Gender={gender}", f"gender_{gender}", 1)
     _push_shap(f"Recent Self-harm={recent_self_harm}", f"has_recent_self_harm_{recent_self_harm}", 1)
     _push_shap(f"Self-harm During Admission={selfharm_adm}", f"self_harm_during_admission_{selfharm_adm}", 1)
 
     df_shap = pd.DataFrame(feat_rows)
 
-    # Policy drivers
+    # 3) 單例 SHAP waterfall 圖（取 |SHAP| 最大的前 12 個）
+    if len(df_shap):
+        df_top = df_shap.reindex(df_shap["model_shap"].abs().sort_values(ascending=False).index).head(12)
+        names = df_top["feature"].tolist()
+        vals = df_top["model_shap"].to_numpy(dtype=float)
+        data_vals = df_top["value"].to_numpy(dtype=float)
+
+        # 組 shap.Explanation 以畫 waterfall
+        exp = shap.Explanation(
+            values=vals,
+            base_values=base_value,
+            feature_names=names,
+            data=data_vals,
+        )
+        shap.plots.waterfall(exp, show=False, max_display=12)
+        st.pyplot(plt.gcf(), clear_figure=True)
+    else:
+        st.caption("No SHAP contributions available for the selected case.")
+
+    # 4) 以表格呈現 SHAP（便於對照數值）
+    st.caption("Model SHAP (top by |value|)")
+    if len(df_shap):
+        st.dataframe(
+            df_shap.reindex(df_shap["model_shap"].abs().sort_values(ascending=False).index)[["feature","value","model_shap"]].head(12),
+            use_container_width=True
+        )
+
+    # 5) Policy drivers（overlay 前的 log-odds 貢獻）
     df_drv = pd.DataFrame(
-        [{"driver": k, "policy_log_odds": round(v, 3)} for k, v in sorted(drivers, key=lambda x: abs(x[1]), reverse=True)]
+        [{"driver": k, "policy_log_odds (pre-scale)": round(v, 3)} for k, v in sorted(drivers, key=lambda x: abs(x[1]), reverse=True)]
     )
+    st.caption("Policy drivers")
+    if len(df_drv):
+        st.dataframe(df_drv, use_container_width=True)
+    else:
+        st.write("No policy drivers for this case.")
 
-    cA, cB = st.columns(2)
-    with cA:
-        st.caption("Model SHAP (top by |value|)")
-        if len(df_shap):
-            st.dataframe(df_shap.reindex(df_shap["model_shap"].abs().sort_values(ascending=False).index).head(12), use_container_width=True)
-        else:
-            st.write("No SHAP available.")
-    with cB:
-        st.caption("Policy drivers (pre-scale/clip)")
-        if len(df_drv):
-            st.dataframe(df_drv, use_container_width=True)
-        else:
-            st.write("No policy drivers for this case.")
-
-    # 對齊卡：方向一致性（同名概念粗對齊）
+    # 6) 模型 vs 政策 對齊卡（方向衝突給 ⚠️）
     st.caption("Alignment check (Model vs Policy) — look for ⚠️ if directions disagree.")
+    def _sign(x): return 1 if x>1e-6 else (-1 if x<-1e-6 else 0)
     align_rows = []
-    def sign(x): 
-        if x>1e-6: return 1
-        if x<-1e-6: return -1
-        return 0
-    # 簡化對齊：用主要連續特徵比較
     name_map = [
         ("Previous Admissions","num_previous_admissions","More previous admissions"),
         ("Medication Compliance","medication_compliance_score","Low medication compliance"),
@@ -529,17 +540,13 @@ with st.expander("🔍 Explanations — Model SHAP vs Policy drivers", expanded=
     ]
     for lab, key, dname in name_map:
         shap_v = float(sv_map.get(key, 0.0))
-        # 近似抓 policy 總符號：在 drivers 中找對應詞首
         pol = 0.0
         for nm, v in drivers:
             if dname.split()[0] in nm: pol += v
-        align_rows.append({
-            "feature": lab,
-            "model_sign": sign(shap_v),
-            "policy_sign": sign(pol),
-            "flag": "⚠️" if (sign(shap_v) * sign(pol) == -1) else ""
-        })
+        ms, ps = _sign(shap_v), _sign(pol)
+        align_rows.append({"feature": lab, "model_sign": ms, "policy_sign": ps, "flag": "⚠️" if (ms*ps==-1) else ""})
     st.dataframe(pd.DataFrame(align_rows), use_container_width=True)
+
 
 # ====== Recommended actions（簡化版，與前版相同邏輯） ======
 st.subheader("Recommended Actions")
