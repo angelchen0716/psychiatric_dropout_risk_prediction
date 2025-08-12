@@ -1,4 +1,4 @@
-# app.py — Psychiatric Dropout Risk (balanced weights + soft safety override + SHAP + Actions + Batch)
+# app.py — Psychiatric Dropout Risk (balanced weights + policy overlay + soft safety uplift + SHAP + Actions + Batch)
 import os
 import streamlit as st
 import pandas as pd
@@ -16,35 +16,39 @@ except Exception:
 
 st.set_page_config(page_title="Psychiatric Dropout Risk", layout="wide")
 st.title("🧠 Psychiatric Dropout Risk Predictor")
+
 # ==== Policy overlay helpers (logit space) ====
-def _sigmoid(x): 
+def _sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
 def _logit(p, eps=1e-6):
     p = float(np.clip(p, eps, 1 - eps))
     return np.log(p / (1 - p))
 
+def _logit_vec(p, eps=1e-6):
+    p = np.clip(p, eps, 1 - eps)
+    return np.log(p / (1 - p))
+
 # 可調的政策疊加權重（單位：log-odds）
 POLICY = {
-    "per_prev_admission": 0.10,   # 每一次過去住院 ↑ 0.10（上限 5 次）
-    "per_point_low_compliance": 0.18,  # (5 - 順從) 每 1 分 ↑ 0.18
-    "per_point_low_support": 0.15,     # (5 - 家庭支持) 每 1 分 ↑ 0.15
-    "per_followup": -0.12,        # 每 1 次出院追蹤 ↓ 0.12
-    "social_worker_yes": -0.20,   # 有社工 ↓ 0.20
+    "per_prev_admission": 0.10,         # 每一次過去住院 ↑ 0.10（上限 5 次）
+    "per_point_low_compliance": 0.18,   # (5 - 順從) 每 1 分 ↑ 0.18
+    "per_point_low_support": 0.15,      # (5 - 家庭支持) 每 1 分 ↑ 0.15
+    "per_followup": -0.12,              # 每 1 次出院追蹤 ↓ 0.12
+    "social_worker_yes": -0.20,         # 有社工 ↓ 0.20
     # 住院日數：短/長皆↑；中段影響小
-    "los_short": 0.35,   # <3 天
-    "los_mid": 0.00,     # 3–14 天
-    "los_long": 0.25,    # >21 天（15–21 給輕微↑）
-    "los_mid_high": 0.10,
+    "los_short": 0.35,      # <3 天
+    "los_mid": 0.00,        # 3–14 天
+    "los_mid_high": 0.10,   # 15–21 天
+    "los_long": 0.25,       # >21 天
     # 診斷疊加（可依場域再調）
     "diag": {
         "Schizophrenia": 0.40, "Bipolar": 0.35, "Depression": 0.25,
         "Personality Disorder": 0.30, "Substance Use Disorder": 0.35,
-        "Dementia": 0.15, "Anxiety": 0.15, "PTSD": 0.20, "OCD": 0.10, 
+        "Dementia": 0.15, "Anxiety": 0.15, "PTSD": 0.20, "OCD": 0.10,
         "ADHD": 0.10, "Other/Unknown": 0.10,
     }
 }
-
 
 # ====== Unified options ======
 DIAG_LIST = [
@@ -101,23 +105,23 @@ def train_demo_model(columns):
     pick_one("has_recent_self_harm", BIN_YESNO)
     pick_one("self_harm_during_admission", BIN_YESNO)
 
-    # ===== Balanced literature-inspired logits =====
+    # Balanced literature-inspired logits
     beta0 = -0.90  # overall prevalence ~30%
     beta = {
-        "has_recent_self_harm_Yes": 0.80,           # ↓ from 1.50
-        "self_harm_during_admission_Yes": 0.60,     # ↓ from 1.20
-        "prev_adm_ge2": 0.60,                       # ↑ slightly
-        "medication_compliance_per_point": -0.25,   # ↑ magnitude
-        "family_support_per_point": -0.20,          # ↑ magnitude
-        "followups_per_visit": -0.12,               # ↑ magnitude
-        "length_of_stay_per_day": 0.05,             # ↑ magnitude
-        "has_social_worker_Yes": -0.25              # keep
+        "has_recent_self_harm_Yes": 0.80,
+        "self_harm_during_admission_Yes": 0.60,
+        "prev_adm_ge2": 0.60,
+        "medication_compliance_per_point": -0.25,
+        "family_support_per_point": -0.20,
+        "followups_per_visit": -0.12,
+        "length_of_stay_per_day": 0.05,
+        "has_social_worker_Yes": -0.25
     }
     beta_diag = {
         "Schizophrenia": 0.40, "Bipolar": 0.35, "Depression": 0.25,
         "Personality Disorder": 0.30, "Substance Use Disorder": 0.35,
-        "Dementia": 0.15, "Anxiety": 0.15, "PTSD": 0.20, "OCD": 0.10, "ADHD": 0.10,
-        "Other/Unknown": 0.10,
+        "Dementia": 0.15, "Anxiety": 0.15, "PTSD": 0.20, "OCD": 0.10,
+        "ADHD": 0.10, "Other/Unknown": 0.10,
     }
 
     prev_ge2 = (X["num_previous_admissions"] >= 2).astype(np.float32)
@@ -135,7 +139,7 @@ def train_demo_model(columns):
     for d, w in beta_diag.items():
         logit = logit + w * X[f"diagnosis_{d}"]
 
-    noise = rng.normal(0.0, 0.35, n).astype(np.float32)  # keep model lively
+    noise = rng.normal(0.0, 0.35, n).astype(np.float32)
     p = 1.0 / (1.0 + np.exp(-(logit + noise)))
     y = (rng.random(n) < p).astype(np.int32)
 
@@ -145,8 +149,7 @@ def train_demo_model(columns):
         random_state=42, tree_method="hist",
         objective="binary:logistic", eval_metric="logloss",
     )
-    # Train with DataFrame to preserve feature_names
-    model.fit(X, y)
+    model.fit(X, y)   # train with DataFrame to preserve feature_names
     return model
 
 def get_feat_names(m):
@@ -221,7 +224,7 @@ def flag_yes(row, prefix):
     col = f"{prefix}_Yes"
     return (col in row.index) and (row[col] == 1)
 
-# ====== Thresholds (relaxed so non‑self‑harm features can move classes) ======
+# ====== Thresholds (relaxed so non-self-harm features can move classes) ======
 MOD_CUT = 20
 HIGH_CUT = 40
 def proba_to_percent(p): return float(p) * 100
@@ -296,7 +299,7 @@ elif los <= 21:
 else:
     lz += POLICY["los_long"]
 
-# 診斷別
+# 診斷別（只取選中的 one-hot）
 for dx, w in POLICY["diag"].items():
     col = f"diagnosis_{dx}"
     if col in X_final.columns and X_final.at[0, col] == 1:
@@ -318,9 +321,8 @@ percent_model = proba_to_percent(p_model)
 percent = proba_to_percent(p_final)
 score = proba_to_score(p_final)
 
-# 門檻（保持你目前設定）
+# 門檻
 level = classify(score)
-
 
 # ====== Model diagnostics ======
 with st.expander("Model diagnostics", expanded=False):
@@ -352,12 +354,10 @@ elif level == "Moderate":
 else:
     st.success("🟢 Low Risk")
 
-
 # ====== SHAP (version-agnostic via XGBoost pred_contribs) ======
 with st.expander("SHAP Explanation", expanded=True):
     st.caption("How to read: positive bars push toward higher dropout risk; negative bars lower it. Only the selected category for each one-hot feature is shown.")
     import xgboost as xgb
-
     try:
         booster = model.get_booster()
         dmat = xgb.DMatrix(X_aligned_df, feature_names=list(X_aligned_df.columns))
@@ -518,47 +518,50 @@ if uploaded is not None:
 
         Xb_aligned, _ = align_df_to_model(df, model)
         Xb_np = to_float32_np(Xb_aligned)
-       # ---- Vectorized policy overlay for batch ----
-def _logit_vec(p, eps=1e-6):
-    p = np.clip(p, eps, 1 - eps)
-    return np.log(p / (1 - p))
 
-lz = _logit_vec(base_probs)
+        # 預測基礎機率
+        base_probs = model.predict_proba(Xb_np, validate_features=False)[:, 1]
 
-# prev admissions
-lz += POLICY["per_prev_admission"] * np.minimum(df["num_previous_admissions"].astype(float).values, 5)
+        # ---- Vectorized policy overlay for batch ----
+        lz = _logit_vec(base_probs)
 
-# compliance & support (center at 5)
-lz += POLICY["per_point_low_compliance"] * np.maximum(0.0, 5.0 - df["medication_compliance_score"].astype(float).values)
-lz += POLICY["per_point_low_support"] * np.maximum(0.0, 5.0 - df["family_support_score"].astype(float).values)
+        # prev admissions（上限 5 次）
+        lz += POLICY["per_prev_admission"] * np.minimum(df["num_previous_admissions"].astype(float).to_numpy(), 5)
 
-# followups
-lz += POLICY["per_followup"] * df["post_discharge_followups"].astype(float).values
+        # compliance & support（以 5 為中心）
+        lz += POLICY["per_point_low_compliance"] * np.maximum(0.0, 5.0 - df["medication_compliance_score"].astype(float).to_numpy())
+        lz += POLICY["per_point_low_support"] * np.maximum(0.0, 5.0 - df["family_support_score"].astype(float).to_numpy())
 
-# social worker
-if "has_social_worker_Yes" in df.columns:
-    lz += POLICY["social_worker_yes"] * (df["has_social_worker_Yes"].values == 1)
+        # followups（保護因子）
+        lz += POLICY["per_followup"] * df["post_discharge_followups"].astype(float).to_numpy()
 
-# LOS
-los = df["length_of_stay"].astype(float).values
-lz += np.where(los < 3, POLICY["los_short"],
-        np.where(los <= 14, POLICY["los_mid"],
-        np.where(los <= 21, POLICY["los_mid_high"], POLICY["los_long"])))
+        # social worker（保護因子）
+        if "has_social_worker_Yes" in df.columns:
+            lz += POLICY["social_worker_yes"] * (df["has_social_worker_Yes"].to_numpy() == 1)
 
-# diagnosis
-diag_term = np.zeros(len(df), dtype=float)
-for dx, w in POLICY["diag"].items():
-    col = f"diagnosis_{dx}"
-    if col in df.columns:
-        diag_term += w * (df[col].values == 1)
-lz += diag_term
+        # LOS：短/長 ↑ 風險
+        los = df["length_of_stay"].astype(float).to_numpy()
+        lz += np.where(los < 3, POLICY["los_short"],
+                np.where(los <= 14, POLICY["los_mid"],
+                np.where(los <= 21, POLICY["los_mid_high"], POLICY["los_long"])))
 
-p_policy = 1.0 / (1.0 + np.exp(-lz))
+        # diagnosis 疊加
+        diag_term = np.zeros(len(df), dtype=float)
+        for dx, w in POLICY["diag"].items():
+            col = f"diagnosis_{dx}"
+            if col in df.columns:
+                diag_term += w * (df[col].to_numpy() == 1)
+        lz += diag_term
 
-# soft uplift for self-harm
-soft_mask = ((df.get("has_recent_self_harm_Yes", 0) == 1) | (df.get("self_harm_during_admission_Yes", 0) == 1)).values
-adj_probs = p_policy.copy()
-adj_probs[soft_mask] = np.minimum(np.maximum(adj_probs[soft_mask], 0.60) + 0.15, 0.90)
+        # 疊加後機率
+        p_policy = 1.0 / (1.0 + np.exp(-lz))
+
+        # self-harm 的 soft uplift
+        hrsh = df.get("has_recent_self_harm_Yes", 0)
+        shadm = df.get("self_harm_during_admission_Yes", 0)
+        soft_mask = ((np.array(hrsh) == 1) | (np.array(shadm) == 1))
+        adj_probs = p_policy.copy()
+        adj_probs[soft_mask] = np.minimum(np.maximum(adj_probs[soft_mask], 0.60) + 0.15, 0.90)
 
         out = raw.copy()
         out["risk_percent"] = (adj_probs * 100).round(1)
