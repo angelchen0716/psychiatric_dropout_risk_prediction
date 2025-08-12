@@ -1,4 +1,4 @@
-# app.py — Psychiatric Dropout Risk (fixed overrides + unified features + grouped SHAP)
+# app.py — Psychiatric Dropout Risk (fixed feature validation + unified features + grouped SHAP)
 import os
 import streamlit as st
 import pandas as pd
@@ -25,7 +25,7 @@ DIAG_LIST = [
 BIN_YESNO = ["Yes","No"]
 GENDER_LIST = ["Male","Female"]
 
-# ====== 統一的特徵欄位模板（**固定，與左側語意一致**）======
+# ====== 統一的特徵欄位模板（與左側語意一致）======
 TEMPLATE_COLUMNS = [
     "age","length_of_stay","num_previous_admissions",
     "medication_compliance_score","family_support_score","post_discharge_followups",
@@ -84,7 +84,7 @@ if model is None:
     p = 1/(1+np.exp(-logit))
     y = (rng.random(n) < p).astype(int)
 
-    model = xgboost = xgb.XGBClassifier(
+    model = xgb.XGBClassifier(
         n_estimators=500, max_depth=4, learning_rate=0.06,
         subsample=0.9, colsample_bytree=0.9, reg_lambda=1.0
     )
@@ -94,12 +94,11 @@ if model is None:
 def set_onehot_by_prefix(df, prefix, value):
     """只把對應 prefix_value 設為 1，其他維持 0"""
     target = f"{prefix}_{value}"
-    for col in df.columns:
-        if col == target:
-            df.at[0, col] = 1
+    if target in df.columns:
+        df.at[0, target] = 1
 
 def flag_yes(row, prefix):
-    """只在 <prefix>_Yes == 1 時回傳 True（避免過去 'substring' 誤判）"""
+    """只在 <prefix>_Yes == 1 時回傳 True"""
     col = f"{prefix}_Yes"
     return (col in row.index) and (row[col] == 1)
 
@@ -127,7 +126,7 @@ with st.sidebar:
     support = st.slider("Family Support Score (0–10)", 0.0, 10.0, 5.0)
     followups = st.slider("Post-discharge Followups", 0, 10, 2)
 
-# ====== 建立 X_final 並更新（**與模板完全一致**）======
+# ====== 建立 X_final 並更新（與模板完全一致）======
 X_final = pd.DataFrame(0, index=[0], columns=TEMPLATE_COLUMNS, dtype=float)
 continuous_map = {
     "age": age,
@@ -146,8 +145,9 @@ set_onehot_by_prefix(X_final, "has_social_worker", social_worker)
 set_onehot_by_prefix(X_final, "has_recent_self_harm", recent_self_harm)
 set_onehot_by_prefix(X_final, "self_harm_during_admission", selfharm_adm)
 
-# ====== 預測 + Safety Override（**只看 _Yes 欄位**）======
-base_prob = model.predict_proba(X_final)[:, 1][0]
+# ====== 預測 + Safety Override（validate_features=False）======
+# 這裡關閉特徵名驗證，避免與模型內建 feature_names 不一致時丟錯
+base_prob = model.predict_proba(X_final, validate_features=False)[:, 1][0]
 percent, score = proba_to_percent(base_prob), proba_to_score(base_prob)
 level = classify(score)
 override_reason = None
@@ -195,7 +195,6 @@ with st.expander("SHAP Explanation", expanded=True):
     ]
     names, vals, data_vals = [], [], []
 
-    # 幫手：抓單一 one-hot 的 shap 值
     def add_onehot_group(title, prefix, value):
         col = f"{prefix}_{value}"
         if col in X_final.columns:
@@ -204,21 +203,16 @@ with st.expander("SHAP Explanation", expanded=True):
             vals.append(sv[idx])
             data_vals.append(1)
 
-    # 先放連續型
     for label, key, dv in cont_feats:
         idx = list(X_final.columns).index(key)
-        names.append(label)
-        vals.append(sv[idx])
-        data_vals.append(dv)
+        names.append(label); vals.append(sv[idx]); data_vals.append(dv)
 
-    # 再放類別型（只顯示被選到的）
     add_onehot_group("Gender","gender", gender)
     add_onehot_group("Diagnosis","diagnosis", diagnosis)
     add_onehot_group("Has Social Worker","has_social_worker", social_worker)
     add_onehot_group("Recent Self-harm","has_recent_self_harm", recent_self_harm)
     add_onehot_group("Self-harm During Admission","self_harm_during_admission", selfharm_adm)
 
-    # 依絕對值排序，最多顯示 12
     order = np.argsort(np.abs(np.array(vals)))[::-1][:12]
     exp = shap.Explanation(
         values=np.array(vals)[order],
@@ -298,7 +292,7 @@ if level == "High":
                            file_name="dropout_risk_SOP.docx",
                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
-# ====== Batch prediction（**Excel 與左側完全一致的語意欄位**）======
+# ====== Batch prediction（Excel 與左側一致的語意欄位）======
 st.markdown("---")
 st.subheader("Batch Prediction (Excel)")
 
@@ -336,7 +330,6 @@ if uploaded is not None:
         def apply_onehot_prefix(human_col, prefix, options):
             if human_col not in raw.columns: return
             for i, v in raw[human_col].astype(str).str.strip().items():
-                # 容錯：不在 options 的值，跳過
                 if v not in options: continue
                 col = f"{prefix}_{v}"
                 if col in df.columns: df.at[i, col] = 1
@@ -347,8 +340,8 @@ if uploaded is not None:
         apply_onehot_prefix("Recent Self-harm","has_recent_self_harm", BIN_YESNO)
         apply_onehot_prefix("Self-harm During Admission","self_harm_during_admission", BIN_YESNO)
 
-        # 預測 + 覆蓋（**只看 _Yes 欄位**）
-        base_probs = model.predict_proba(df)[:, 1]
+        # 預測 + 覆蓋（validate_features=False；只看 _Yes 欄位）
+        base_probs = model.predict_proba(df, validate_features=False)[:, 1]
         adj_probs = base_probs.copy()
         yes_recent = (df["has_recent_self_harm_Yes"] == 1)
         yes_adm = (df["self_harm_during_admission_Yes"] == 1)
