@@ -1,4 +1,4 @@
-# app.py — Psychiatric Dropout Risk (multi-diagnoses + balanced weights + policy overlay + soft safety uplift + SHAP + Actions + Batch)
+# app.py — Psychiatric Dropout Risk (multi-diagnoses + balanced weights + policy overlay + global calibration + soft safety uplift + SHAP + Actions + Batch)
 import os
 import re
 import streamlit as st
@@ -29,6 +29,10 @@ def _logit(p, eps=1e-6):
 def _logit_vec(p, eps=1e-6):
     p = np.clip(p, eps, 1 - eps)
     return np.log(p / (1 - p))
+
+# === Global calibration (shift everything upward; adjustable in sidebar) ===
+CAL_LOGIT_SHIFT = float(os.getenv("RISK_CAL_SHIFT", "0.40"))  # default +0.40
+SOFT_UPLIFT = {"floor": 0.65, "add": 0.20, "cap": 0.95}      # self-harm uplift
 
 # 文獻啟發的政策疊加（log-odds）；性別預設不進分（多研究不穩定/常不顯著）
 POLICY = {
@@ -89,6 +93,15 @@ def try_load_model(path="dropout_model.pkl"):
     except Exception:
         return None
 
+def xgboost_classifier():
+    import xgboost as xgb
+    return xgb.XGBClassifier(
+        n_estimators=450, max_depth=4, learning_rate=0.06,
+        subsample=0.9, colsample_bytree=0.9, reg_lambda=1.0,
+        random_state=42, tree_method="hist",
+        objective="binary:logistic", eval_metric="logloss",
+    )
+
 def train_demo_model(columns):
     import xgboost as xgb
     rng = np.random.default_rng(42)
@@ -134,7 +147,7 @@ def train_demo_model(columns):
             X.at[ridx, f"diagnosis_{DIAG_LIST[rand_pick[j]]}"] = 1
 
     # Balanced literature-inspired logits
-    beta0 = -1.00  # 基線盛行率 ~25–27%
+    beta0 = -0.60  # ↑基線（約 35–40%），讓 Model Probability 自然較高
     beta = {
         "has_recent_self_harm_Yes": 0.80,
         "self_harm_during_admission_Yes": 0.60,
@@ -182,15 +195,6 @@ def train_demo_model(columns):
     model.fit(X, y)   # 用 DataFrame，保留 feature_names
     return model
 
-def xgboost_classifier():
-    import xgboost as xgb
-    return xgb.XGBClassifier(
-        n_estimators=450, max_depth=4, learning_rate=0.06,
-        subsample=0.9, colsample_bytree=0.9, reg_lambda=1.0,
-        random_state=42, tree_method="hist",
-        objective="binary:logistic", eval_metric="logloss",
-    )
-
 def get_feat_names(m):
     try:
         b = m.get_booster()
@@ -212,7 +216,7 @@ if model is not None:
 
 if (not loaded) or use_demo:
     model = train_demo_model(TEMPLATE_COLUMNS)
-    model_source = "demo (balanced weights, multi-diagnoses)"
+    model_source = "demo (balanced weights, multi-diagnoses, higher baseline)"
 else:
     model_source = "loaded from dropout_model.pkl"
 
@@ -294,6 +298,10 @@ with st.sidebar:
     support = st.slider("Family Support Score (0–10)", 0.0, 10.0, 5.0)
     followups = st.slider("Post-discharge Followups", 0, 10, 2)
 
+    with st.expander("Advanced calibration", expanded=False):
+        cal_shift = st.slider("Calibration (log-odds, global)", -1.0, 1.0, CAL_LOGIT_SHIFT, 0.05)
+    CAL_LOGIT_SHIFT = cal_shift
+
 # ====== Build single-row DF ======
 X_final = pd.DataFrame(0, index=[0], columns=TEMPLATE_COLUMNS, dtype=float)
 for k, v in {
@@ -311,7 +319,7 @@ set_onehot_by_prefix(X_final, "has_social_worker", social_worker)
 set_onehot_by_prefix(X_final, "has_recent_self_harm", recent_self_harm)
 set_onehot_by_prefix(X_final, "self_harm_during_admission", selfharm_adm)
 
-# ====== Predict (align + float32 + validate_features=False + policy overlay) ======
+# ====== Predict (align + float32 + validate_features=False + policy overlay + calibration) ======
 X_aligned_df, used_names = align_df_to_model(X_final, model)
 X_np = to_float32_np(X_aligned_df)
 p_model = float(model.predict_proba(X_np, validate_features=False)[:, 1][0])
@@ -339,12 +347,14 @@ for dx, w in POLICY["diag"].items():
     if col in X_final.columns and X_final.at[0, col] == 1:
         lz += w
 
+# 全域校正（把整體機率抬高）
+lz += CAL_LOGIT_SHIFT
 p_policy = _sigmoid(lz)
 
 # ---- Soft safety uplift（不鎖死，只提升）----
 soft_reason = None
 if flag_yes(X_final.iloc[0], "has_recent_self_harm") or flag_yes(X_final.iloc[0], "self_harm_during_admission"):
-    p_final = min(max(p_policy, 0.60) + 0.15, 0.90)
+    p_final = min(max(p_policy, SOFT_UPLIFT["floor"]) + SOFT_UPLIFT["add"], SOFT_UPLIFT["cap"])
     soft_reason = "self-harm uplift"
 else:
     p_final = p_policy
@@ -548,7 +558,6 @@ if uploaded is not None:
                         if col in df.columns:
                             df.at[i, col] = 1
 
-        # Gender / Social worker / (Self-harm) ：單值
         def apply_onehot_prefix(human_col, prefix, options):
             if human_col not in raw.columns: return
             for i, v in raw[human_col].astype(str).str.strip().items():
@@ -572,7 +581,7 @@ if uploaded is not None:
         Xb_np = to_float32_np(Xb_aligned)
         base_probs = model.predict_proba(Xb_np, validate_features=False)[:, 1]
 
-        # ---- Vectorized policy overlay for batch（多診斷可累加）----
+        # ---- Vectorized policy overlay for batch（多診斷可累加 + calibration）----
         lz = _logit_vec(base_probs)
         lz += POLICY["per_prev_admission"] * np.minimum(df["num_previous_admissions"].astype(float).to_numpy(), 5)
         lz += POLICY["per_point_low_compliance"] * np.maximum(0.0, 5.0 - df["medication_compliance_score"].astype(float).to_numpy())
@@ -593,14 +602,19 @@ if uploaded is not None:
                 diag_term += w * (df[col].to_numpy() == 1)
         lz += diag_term
 
+        # 全域校正
+        lz += CAL_LOGIT_SHIFT
         p_policy = 1.0 / (1.0 + np.exp(-lz))
 
-        # soft uplift for self-harm
+        # self-harm 的 soft uplift
         hrsh = df.get("has_recent_self_harm_Yes", 0)
         shadm = df.get("self_harm_during_admission_Yes", 0)
         soft_mask = ((np.array(hrsh) == 1) | (np.array(shadm) == 1))
         adj_probs = p_policy.copy()
-        adj_probs[soft_mask] = np.minimum(np.maximum(adj_probs[soft_mask], 0.60) + 0.15, 0.90)
+        adj_probs[soft_mask] = np.minimum(
+            np.maximum(adj_probs[soft_mask], SOFT_UPLIFT["floor"]) + SOFT_UPLIFT["add"],
+            SOFT_UPLIFT["cap"]
+        )
 
         out = raw.copy()
         out["risk_percent"] = (adj_probs * 100).round(1)
