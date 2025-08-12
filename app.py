@@ -1,4 +1,4 @@
-# app.py — Psychiatric Dropout Risk (fixed feature validation + unified features + grouped SHAP)
+# app.py — Psychiatric Dropout Risk (robust feature alignment + float32 + grouped SHAP)
 import os
 import streamlit as st
 import pandas as pd
@@ -90,15 +90,62 @@ if model is None:
     )
     model.fit(X, y)
 
+# ====== 關鍵：模型特徵對齊 + float32 轉換 =======
+def get_model_feature_order(m):
+    """回傳模型訓練時的特徵名稱序（若不可得，則回傳 None 與期望長度）"""
+    order = None
+    exp_len = None
+    try:
+        booster = getattr(m, "get_booster", lambda: None)()
+        if booster is not None:
+            names = getattr(booster, "feature_names", None)
+            if names:
+                order = list(names)
+                exp_len = len(order)
+    except Exception:
+        pass
+    if order is None:
+        # 某些情況只有 feature_names_in_ 或 n_features_in_
+        if hasattr(m, "feature_names_in_"):
+            order = list(m.feature_names_in_)
+            exp_len = len(order)
+        elif hasattr(m, "n_features_in_"):
+            exp_len = int(m.n_features_in_)
+    return order, exp_len
+
+def align_df_to_model(df: pd.DataFrame, m):
+    """將 df 對齊到模型需要的欄位序與長度；缺的補 0，多的丟掉；回傳 (aligned_df, used_feature_names)"""
+    names, exp_len = get_model_feature_order(m)
+    if names:
+        # 以訓練特徵名為準
+        aligned = pd.DataFrame(0, index=df.index, columns=names, dtype=np.float32)
+        inter = [c for c in names if c in df.columns]
+        aligned.loc[:, inter] = df[inter].astype(np.float32).values
+        return aligned, names
+    else:
+        # 沒有名稱資訊但知道需要的長度 -> 若長度相符就原樣轉 float32；否則以現在 df 為準（可能仍會報錯，建議重訓）
+        out = df.astype(np.float32)
+        if (exp_len is not None) and (out.shape[1] != exp_len):
+            # 嘗試截斷或補零到期望長度
+            if out.shape[1] > exp_len:
+                out = out.iloc[:, :exp_len]
+            else:
+                # 補零欄
+                add = exp_len - out.shape[1]
+                pad = pd.DataFrame(0, index=out.index, columns=[f"_pad_{i}" for i in range(add)], dtype=np.float32)
+                out = pd.concat([out, pad], axis=1)
+        return out, list(out.columns)
+
+def to_float32_np(df: pd.DataFrame):
+    return df.astype(np.float32).values
+
 # ====== 工具函數（精準覆蓋）======
 def set_onehot_by_prefix(df, prefix, value):
-    """只把對應 prefix_value 設為 1，其他維持 0"""
     target = f"{prefix}_{value}"
     if target in df.columns:
         df.at[0, target] = 1
 
 def flag_yes(row, prefix):
-    """只在 <prefix>_Yes == 1 時回傳 True"""
     col = f"{prefix}_Yes"
     return (col in row.index) and (row[col] == 1)
 
@@ -145,9 +192,11 @@ set_onehot_by_prefix(X_final, "has_social_worker", social_worker)
 set_onehot_by_prefix(X_final, "has_recent_self_harm", recent_self_harm)
 set_onehot_by_prefix(X_final, "self_harm_during_admission", selfharm_adm)
 
-# ====== 預測 + Safety Override（validate_features=False）======
-# 這裡關閉特徵名驗證，避免與模型內建 feature_names 不一致時丟錯
-base_prob = model.predict_proba(X_final, validate_features=False)[:, 1][0]
+# ====== 對齊到模型特徵並預測（validate_features=False + float32）======
+X_aligned_df, used_names = align_df_to_model(X_final, model)
+X_np = to_float32_np(X_aligned_df)
+base_prob = model.predict_proba(X_np, validate_features=False)[:, 1][0]
+
 percent, score = proba_to_percent(base_prob), proba_to_score(base_prob)
 level = classify(score)
 override_reason = None
@@ -174,18 +223,22 @@ elif level == "Moderate":
 else:
     st.success("🟢 Low Risk")
 
-# ====== SHAP（分組聚合：只顯示左側同語意標籤）======
+# ====== SHAP（用對齊後矩陣計算，再映射回左側語意標籤）======
 with st.expander("SHAP Explanation", expanded=True):
+    # 以對齊後的欄位順序建立 explainer
     explainer = shap.TreeExplainer(model)
-    sv = explainer.shap_values(X_final)
+    # 注意：這裡用 numpy float32 輸入，避免 columnar 介面問題
+    sv_raw = explainer.shap_values(X_np)
     base_value = explainer.expected_value
     if isinstance(base_value, (list, np.ndarray)) and not np.isscalar(base_value):
         base_value = base_value[0]
-        if isinstance(sv, list): sv = sv[0]
-    sv = sv[0]  # (n_features,)
+        if isinstance(sv_raw, list): sv_raw = sv_raw[0]
+    sv_raw = sv_raw[0]  # (n_features_aligned,)
 
-    # 連續特徵直接取值
-    cont_feats = [
+    # 把 shap 值對應回我們的 TEMPLATE_COLUMNS 名稱（若模型順序不同，以 used_names 映射）
+    sv_map = dict(zip(used_names, sv_raw))
+    # 連續特徵
+    cont_list = [
         ("Age","age", X_final.at[0,"age"]),
         ("Length of Stay (days)","length_of_stay", X_final.at[0,"length_of_stay"]),
         ("Previous Admissions (1y)","num_previous_admissions", X_final.at[0,"num_previous_admissions"]),
@@ -194,24 +247,22 @@ with st.expander("SHAP Explanation", expanded=True):
         ("Post-discharge Followups","post_discharge_followups", X_final.at[0,"post_discharge_followups"]),
     ]
     names, vals, data_vals = [], [], []
+    for label, key, dv in cont_list:
+        if key in sv_map:
+            names.append(label); vals.append(sv_map[key]); data_vals.append(dv)
 
-    def add_onehot_group(title, prefix, value):
+    # one-hot：只顯示被選中的那一個
+    def add_onehot(title, prefix, value):
         col = f"{prefix}_{value}"
-        if col in X_final.columns:
-            idx = list(X_final.columns).index(col)
+        if col in sv_map:
             names.append(f"{title}={value}")
-            vals.append(sv[idx])
+            vals.append(sv_map[col])
             data_vals.append(1)
-
-    for label, key, dv in cont_feats:
-        idx = list(X_final.columns).index(key)
-        names.append(label); vals.append(sv[idx]); data_vals.append(dv)
-
-    add_onehot_group("Gender","gender", gender)
-    add_onehot_group("Diagnosis","diagnosis", diagnosis)
-    add_onehot_group("Has Social Worker","has_social_worker", social_worker)
-    add_onehot_group("Recent Self-harm","has_recent_self_harm", recent_self_harm)
-    add_onehot_group("Self-harm During Admission","self_harm_during_admission", selfharm_adm)
+    add_onehot("Gender","gender", gender)
+    add_onehot("Diagnosis","diagnosis", diagnosis)
+    add_onehot("Has Social Worker","has_social_worker", social_worker)
+    add_onehot("Recent Self-harm","has_recent_self_harm", recent_self_harm)
+    add_onehot("Self-harm During Admission","self_harm_during_admission", selfharm_adm)
 
     order = np.argsort(np.abs(np.array(vals)))[::-1][:12]
     exp = shap.Explanation(
@@ -296,7 +347,6 @@ if level == "High":
 st.markdown("---")
 st.subheader("Batch Prediction (Excel)")
 
-# 範本：提供「人類可讀欄位」供填寫
 friendly_cols = [
     "Age","Gender","Diagnosis","Length of Stay (days)","Previous Admissions (1y)",
     "Has Social Worker","Medication Compliance Score (0–10)",
@@ -313,10 +363,8 @@ uploaded = st.file_uploader("📂 Upload Excel", type=["xlsx"])
 if uploaded is not None:
     try:
         raw = pd.read_excel(uploaded)
-        # 轉換到同一 TEMPLATE_COLUMNS
         df = pd.DataFrame(0, index=raw.index, columns=TEMPLATE_COLUMNS, dtype=float)
 
-        # 連續與計數
         def safe_get(col, default=0):
             return raw[col] if col in raw.columns else default
         df["age"] = safe_get("Age")
@@ -326,7 +374,6 @@ if uploaded is not None:
         df["family_support_score"] = safe_get("Family Support Score (0–10)")
         df["post_discharge_followups"] = safe_get("Post-discharge Followups")
 
-        # one-hot 映射（大小寫/空白寬鬆）
         def apply_onehot_prefix(human_col, prefix, options):
             if human_col not in raw.columns: return
             for i, v in raw[human_col].astype(str).str.strip().items():
@@ -340,8 +387,11 @@ if uploaded is not None:
         apply_onehot_prefix("Recent Self-harm","has_recent_self_harm", BIN_YESNO)
         apply_onehot_prefix("Self-harm During Admission","self_harm_during_admission", BIN_YESNO)
 
-        # 預測 + 覆蓋（validate_features=False；只看 _Yes 欄位）
-        base_probs = model.predict_proba(df, validate_features=False)[:, 1]
+        # 對齊到模型特徵並預測
+        Xb_aligned, used_names_b = align_df_to_model(df, model)
+        Xb_np = to_float32_np(Xb_aligned)
+        base_probs = model.predict_proba(Xb_np, validate_features=False)[:, 1]
+
         adj_probs = base_probs.copy()
         yes_recent = (df["has_recent_self_harm_Yes"] == 1)
         yes_adm = (df["self_harm_during_admission_Yes"] == 1)
@@ -351,7 +401,7 @@ if uploaded is not None:
         out["risk_percent"] = (adj_probs * 100).round(1)
         out["risk_score_0_100"] = (adj_probs * 100).round().astype(int)
         out["risk_level"] = out["risk_score_0_100"].apply(
-            lambda s: "High" if s >= HIGH_CUT else ("Moderate" if s >= MOD_CUT else "Low")
+            lambda s: "High" if s >= 50 else ("Moderate" if s >= 30 else "Low")
         )
         st.dataframe(out)
 
