@@ -1,5 +1,6 @@
-# app.py — Psychiatric Dropout Risk (balanced weights + policy overlay + soft safety uplift + SHAP + Actions + Batch)
+# app.py — Psychiatric Dropout Risk (multi-diagnoses + balanced weights + policy overlay + soft safety uplift + SHAP + Actions + Batch)
 import os
+import re
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -29,24 +30,31 @@ def _logit_vec(p, eps=1e-6):
     p = np.clip(p, eps, 1 - eps)
     return np.log(p / (1 - p))
 
-# 可調的政策疊加權重（單位：log-odds）
+# 文獻啟發的政策疊加（log-odds）；性別預設不進分（多研究不穩定/常不顯著）
 POLICY = {
-    "per_prev_admission": 0.10,         # 每一次過去住院 ↑ 0.10（上限 5 次）
-    "per_point_low_compliance": 0.18,   # (5 - 順從) 每 1 分 ↑ 0.18
-    "per_point_low_support": 0.15,      # (5 - 家庭支持) 每 1 分 ↑ 0.15
-    "per_followup": -0.12,              # 每 1 次出院追蹤 ↓ 0.12
-    "social_worker_yes": -0.20,         # 有社工 ↓ 0.20
-    # 住院日數：短/長皆↑；中段影響小
-    "los_short": 0.35,      # <3 天
+    "per_prev_admission": 0.15,         # 每多 1 次既往住院 ↑ 0.15（上限 5 次）
+    "per_point_low_compliance": 0.22,   # (5 - 順從) 每 1 分 ↑ 0.22
+    "per_point_low_support": 0.18,      # (5 - 家庭支持) 每 1 分 ↑ 0.18
+    "per_followup": -0.15,              # 每 1 次出院追蹤 ↓ 0.15
+    "social_worker_yes": -0.25,         # 有社工 ↓ 0.25
+    # 住院日數：短/長 ↑；中段 ~
+    "los_short": 0.45,      # <3 天
     "los_mid": 0.00,        # 3–14 天
-    "los_mid_high": 0.10,   # 15–21 天
-    "los_long": 0.25,       # >21 天
-    # 診斷疊加（可依場域再調）
+    "los_mid_high": 0.15,   # 15–21 天
+    "los_long": 0.35,       # >21 天
+    # 診斷權重（可累加；多診斷共病 → 相加）
     "diag": {
-        "Schizophrenia": 0.40, "Bipolar": 0.35, "Depression": 0.25,
-        "Personality Disorder": 0.30, "Substance Use Disorder": 0.35,
-        "Dementia": 0.15, "Anxiety": 0.15, "PTSD": 0.20, "OCD": 0.10,
-        "ADHD": 0.10, "Other/Unknown": 0.10,
+        "Substance Use Disorder":  0.30,  # ≈ ln(1.35)；SUD 治療脫落率較高
+        "Personality Disorder":    0.35,  # 早期流失偏高
+        "Schizophrenia":          -0.20,  # 心理社會治療 RCT 脫落偏低（~13%）
+        "Bipolar":                 0.05,
+        "Depression":             -0.25,  # 門診脫落 ~14–15%
+        "PTSD":                    0.05,
+        "Anxiety":                -0.05,
+        "OCD":                    -0.05,
+        "Dementia":                0.00,
+        "ADHD":                    0.00,
+        "Other/Unknown":           0.00,
     }
 }
 
@@ -84,7 +92,7 @@ def try_load_model(path="dropout_model.pkl"):
 def train_demo_model(columns):
     import xgboost as xgb
     rng = np.random.default_rng(42)
-    n = 8000
+    n = 9000
     X = pd.DataFrame(0, index=range(n), columns=columns, dtype=np.float32)
 
     # Marginals
@@ -100,13 +108,33 @@ def train_demo_model(columns):
         for i, opt in enumerate(options):
             X.loc[idx == i, f"{prefix}_{opt}"] = 1
     pick_one("gender", GENDER_LIST)
-    pick_one("diagnosis", DIAG_LIST)
     pick_one("has_social_worker", BIN_YESNO)
     pick_one("has_recent_self_harm", BIN_YESNO)
     pick_one("self_harm_during_admission", BIN_YESNO)
 
+    # 主診斷 + 隨機共病（讓模型學到多診斷）
+    idx_primary = rng.integers(0, len(DIAG_LIST), n)
+    for i, d in enumerate(DIAG_LIST):
+        X.loc[idx_primary == i, f"diagnosis_{d}"] = 1
+    extra_probs = {  # 常見共病機率（可調）
+        "Substance Use Disorder": 0.20,
+        "Anxiety": 0.20,
+        "Depression": 0.25,
+        "PTSD": 0.10,
+    }
+    for d, pr in extra_probs.items():
+        mask = (rng.random(n) < pr)
+        X.loc[mask, f"diagnosis_{d}"] = 1
+    # 確保至少一個診斷
+    has_any = X[[f"diagnosis_{d}" for d in DIAG_LIST]].sum(axis=1) > 0
+    if not has_any.all():
+        fix_idx = has_any[~has_any].index
+        rand_pick = rng.integers(0, len(DIAG_LIST), len(fix_idx))
+        for j, ridx in enumerate(fix_idx):
+            X.at[ridx, f"diagnosis_{DIAG_LIST[rand_pick[j]]}"] = 1
+
     # Balanced literature-inspired logits
-    beta0 = -0.90  # overall prevalence ~30%
+    beta0 = -1.00  # 基線盛行率 ~25–27%
     beta = {
         "has_recent_self_harm_Yes": 0.80,
         "self_harm_during_admission_Yes": 0.60,
@@ -118,10 +146,17 @@ def train_demo_model(columns):
         "has_social_worker_Yes": -0.25
     }
     beta_diag = {
-        "Schizophrenia": 0.40, "Bipolar": 0.35, "Depression": 0.25,
-        "Personality Disorder": 0.30, "Substance Use Disorder": 0.35,
-        "Dementia": 0.15, "Anxiety": 0.15, "PTSD": 0.20, "OCD": 0.10,
-        "ADHD": 0.10, "Other/Unknown": 0.10,
+        "Substance Use Disorder":  0.30,
+        "Personality Disorder":    0.35,
+        "Schizophrenia":          -0.20,
+        "Bipolar":                 0.05,
+        "Depression":             -0.25,
+        "PTSD":                    0.05,
+        "Anxiety":                -0.05,
+        "OCD":                    -0.05,
+        "Dementia":                0.00,
+        "ADHD":                    0.00,
+        "Other/Unknown":           0.00,
     }
 
     prev_ge2 = (X["num_previous_admissions"] >= 2).astype(np.float32)
@@ -143,14 +178,18 @@ def train_demo_model(columns):
     p = 1.0 / (1.0 + np.exp(-(logit + noise)))
     y = (rng.random(n) < p).astype(np.int32)
 
-    model = xgb.XGBClassifier(
+    model = xgboost_classifier()
+    model.fit(X, y)   # 用 DataFrame，保留 feature_names
+    return model
+
+def xgboost_classifier():
+    import xgboost as xgb
+    return xgb.XGBClassifier(
         n_estimators=450, max_depth=4, learning_rate=0.06,
         subsample=0.9, colsample_bytree=0.9, reg_lambda=1.0,
         random_state=42, tree_method="hist",
         objective="binary:logistic", eval_metric="logloss",
     )
-    model.fit(X, y)   # train with DataFrame to preserve feature_names
-    return model
 
 def get_feat_names(m):
     try:
@@ -173,7 +212,7 @@ if model is not None:
 
 if (not loaded) or use_demo:
     model = train_demo_model(TEMPLATE_COLUMNS)
-    model_source = "demo (balanced weights)"
+    model_source = "demo (balanced weights, multi-diagnoses)"
 else:
     model_source = "loaded from dropout_model.pkl"
 
@@ -220,11 +259,17 @@ def set_onehot_by_prefix(df, prefix, value):
     if col in df.columns:
         df.at[0, col] = 1
 
+def set_onehot_by_prefix_multi(df, prefix, values):
+    for v in values:
+        col = f"{prefix}_{v}"
+        if col in df.columns:
+            df.at[0, col] = 1
+
 def flag_yes(row, prefix):
     col = f"{prefix}_Yes"
     return (col in row.index) and (row[col] == 1)
 
-# ====== Thresholds (relaxed so non-self-harm features can move classes) ======
+# ====== Thresholds ======
 MOD_CUT = 20
 HIGH_CUT = 40
 def proba_to_percent(p): return float(p) * 100
@@ -239,7 +284,7 @@ with st.sidebar:
     st.header("Patient Info")
     age = st.slider("Age", 18, 90, 35)
     gender = st.selectbox("Gender", GENDER_LIST)
-    diagnosis = st.selectbox("Diagnosis", DIAG_LIST)
+    diagnoses = st.multiselect("Diagnoses (multi-select)", DIAG_LIST, default=[])
     length_of_stay = st.slider("Length of Stay (days)", 1, 90, 10)
     num_adm = st.slider("Previous Admissions (1y)", 0, 15, 1)
     social_worker = st.radio("Has Social Worker", BIN_YESNO, index=1)
@@ -261,7 +306,7 @@ for k, v in {
 }.items():
     X_final.at[0, k] = v
 set_onehot_by_prefix(X_final, "gender", gender)
-set_onehot_by_prefix(X_final, "diagnosis", diagnosis)
+set_onehot_by_prefix_multi(X_final, "diagnosis", diagnoses)
 set_onehot_by_prefix(X_final, "has_social_worker", social_worker)
 set_onehot_by_prefix(X_final, "has_recent_self_harm", recent_self_harm)
 set_onehot_by_prefix(X_final, "self_harm_during_admission", selfharm_adm)
@@ -271,24 +316,14 @@ X_aligned_df, used_names = align_df_to_model(X_final, model)
 X_np = to_float32_np(X_aligned_df)
 p_model = float(model.predict_proba(X_np, validate_features=False)[:, 1][0])
 
-# ---- Policy overlay on logit space（讓非 self-harm 也能推高風險）----
+# ---- Policy overlay on logit space（多診斷可累加）----
 lz = _logit(p_model)
-
-# 前次住院次數（最多計 5 次）
 lz += POLICY["per_prev_admission"] * min(int(X_final.at[0, "num_previous_admissions"]), 5)
-
-# 順從度、家庭支持（以 5 為中心）
 lz += POLICY["per_point_low_compliance"] * max(0.0, 5.0 - float(X_final.at[0, "medication_compliance_score"]))
 lz += POLICY["per_point_low_support"] * max(0.0, 5.0 - float(X_final.at[0, "family_support_score"]))
-
-# 出院追蹤次數（保護因子）
 lz += POLICY["per_followup"] * float(X_final.at[0, "post_discharge_followups"])
-
-# 社工（保護因子）
 if X_final.at[0, "has_social_worker_Yes"] == 1:
     lz += POLICY["social_worker_yes"]
-
-# 住院日數：短/長 ↑ 風險
 los = float(X_final.at[0, "length_of_stay"])
 if los < 3:
     lz += POLICY["los_short"]
@@ -298,21 +333,18 @@ elif los <= 21:
     lz += POLICY["los_mid_high"]
 else:
     lz += POLICY["los_long"]
-
-# 診斷別（只取選中的 one-hot）
+# 診斷（全部加總）
 for dx, w in POLICY["diag"].items():
     col = f"diagnosis_{dx}"
     if col in X_final.columns and X_final.at[0, col] == 1:
         lz += w
-        break
 
-# 疊加後的政策機率
 p_policy = _sigmoid(lz)
 
-# ---- Soft safety uplift for self-harm（不鎖死，僅提升）----
+# ---- Soft safety uplift（不鎖死，只提升）----
 soft_reason = None
 if flag_yes(X_final.iloc[0], "has_recent_self_harm") or flag_yes(X_final.iloc[0], "self_harm_during_admission"):
-    p_final = min(max(p_policy, 0.60) + 0.15, 0.90)  # floor 0.60, +0.15, cap 0.90
+    p_final = min(max(p_policy, 0.60) + 0.15, 0.90)
     soft_reason = "self-harm uplift"
 else:
     p_final = p_policy
@@ -320,8 +352,6 @@ else:
 percent_model = proba_to_percent(p_model)
 percent = proba_to_percent(p_final)
 score = proba_to_score(p_final)
-
-# 門檻
 level = classify(score)
 
 # ====== Model diagnostics ======
@@ -367,7 +397,6 @@ with st.expander("SHAP Explanation", expanded=True):
         feat_contrib = contrib[:-1]
         sv_map = dict(zip(list(X_aligned_df.columns), feat_contrib))
     except Exception:
-        # Fallback to TreeExplainer
         explainer = shap.TreeExplainer(model)
         sv_raw = explainer.shap_values(X_aligned_df)
         base_value = explainer.expected_value
@@ -394,8 +423,10 @@ with st.expander("SHAP Explanation", expanded=True):
         col = f"{prefix}_{value}"
         if col in sv_map:
             names.append(f"{title}={value}"); vals.append(float(sv_map[col])); data_vals.append(1)
+
+    for dx in diagnoses:
+        add_onehot("Diagnosis","diagnosis", dx)
     add_onehot("Gender","gender", gender)
-    add_onehot("Diagnosis","diagnosis", diagnosis)
     add_onehot("Has Social Worker","has_social_worker", social_worker)
     add_onehot("Recent Self-harm","has_recent_self_harm", recent_self_harm)
     add_onehot("Self-harm During Admission","self_harm_during_admission", selfharm_adm)
@@ -478,7 +509,8 @@ st.markdown("---")
 st.subheader("Batch Prediction (Excel)")
 
 friendly_cols = [
-    "Age","Gender","Diagnosis","Length of Stay (days)","Previous Admissions (1y)",
+    "Age","Gender","Diagnoses",  # 多診斷（逗號/分號/斜線/| 分隔），相容舊欄位 Diagnosis
+    "Length of Stay (days)","Previous Admissions (1y)",
     "Has Social Worker","Medication Compliance Score (0–10)",
     "Recent Self-harm","Self-harm During Admission",
     "Family Support Score (0–10)","Post-discharge Followups"
@@ -503,49 +535,57 @@ if uploaded is not None:
         df["family_support_score"] = safe_get("Family Support Score (0–10)")
         df["post_discharge_followups"] = safe_get("Post-discharge Followups")
 
+        def apply_onehot_prefix_multi(human_col, prefix, options):
+            if human_col not in raw.columns:
+                return
+            for i, cell in raw[human_col].astype(str).fillna("").items():
+                parts = [p.strip() for p in re.split(r"[;,/|]", cell) if p.strip()]
+                if not parts and cell.strip():
+                    parts = [cell.strip()]
+                for v in parts:
+                    if v in options:
+                        col = f"{prefix}_{v}"
+                        if col in df.columns:
+                            df.at[i, col] = 1
+
+        # Gender / Social worker / (Self-harm) ：單值
         def apply_onehot_prefix(human_col, prefix, options):
             if human_col not in raw.columns: return
             for i, v in raw[human_col].astype(str).str.strip().items():
-                if v not in options: continue
-                col = f"{prefix}_{v}"
-                if col in df.columns: df.at[i, col] = 1
+                if v in options:
+                    col = f"{prefix}_{v}"
+                    if col in df.columns: df.at[i, col] = 1
 
         apply_onehot_prefix("Gender","gender", GENDER_LIST)
-        apply_onehot_prefix("Diagnosis","diagnosis", DIAG_LIST)
+
+        # Diagnoses：優先吃多值欄位；相容舊欄位 Diagnosis
+        if "Diagnoses" in raw.columns:
+            apply_onehot_prefix_multi("Diagnoses","diagnosis", DIAG_LIST)
+        elif "Diagnosis" in raw.columns:
+            apply_onehot_prefix_multi("Diagnosis","diagnosis", DIAG_LIST)
+
         apply_onehot_prefix("Has Social Worker","has_social_worker", BIN_YESNO)
         apply_onehot_prefix("Recent Self-harm","has_recent_self_harm", BIN_YESNO)
         apply_onehot_prefix("Self-harm During Admission","self_harm_during_admission", BIN_YESNO)
 
         Xb_aligned, _ = align_df_to_model(df, model)
         Xb_np = to_float32_np(Xb_aligned)
-
-        # 預測基礎機率
         base_probs = model.predict_proba(Xb_np, validate_features=False)[:, 1]
 
-        # ---- Vectorized policy overlay for batch ----
+        # ---- Vectorized policy overlay for batch（多診斷可累加）----
         lz = _logit_vec(base_probs)
-
-        # prev admissions（上限 5 次）
         lz += POLICY["per_prev_admission"] * np.minimum(df["num_previous_admissions"].astype(float).to_numpy(), 5)
-
-        # compliance & support（以 5 為中心）
         lz += POLICY["per_point_low_compliance"] * np.maximum(0.0, 5.0 - df["medication_compliance_score"].astype(float).to_numpy())
         lz += POLICY["per_point_low_support"] * np.maximum(0.0, 5.0 - df["family_support_score"].astype(float).to_numpy())
-
-        # followups（保護因子）
         lz += POLICY["per_followup"] * df["post_discharge_followups"].astype(float).to_numpy()
-
-        # social worker（保護因子）
         if "has_social_worker_Yes" in df.columns:
             lz += POLICY["social_worker_yes"] * (df["has_social_worker_Yes"].to_numpy() == 1)
 
-        # LOS：短/長 ↑ 風險
         los = df["length_of_stay"].astype(float).to_numpy()
         lz += np.where(los < 3, POLICY["los_short"],
                 np.where(los <= 14, POLICY["los_mid"],
                 np.where(los <= 21, POLICY["los_mid_high"], POLICY["los_long"])))
 
-        # diagnosis 疊加
         diag_term = np.zeros(len(df), dtype=float)
         for dx, w in POLICY["diag"].items():
             col = f"diagnosis_{dx}"
@@ -553,10 +593,9 @@ if uploaded is not None:
                 diag_term += w * (df[col].to_numpy() == 1)
         lz += diag_term
 
-        # 疊加後機率
         p_policy = 1.0 / (1.0 + np.exp(-lz))
 
-        # self-harm 的 soft uplift
+        # soft uplift for self-harm
         hrsh = df.get("has_recent_self_harm_Yes", 0)
         shadm = df.get("self_harm_during_admission_Yes", 0)
         soft_mask = ((np.array(hrsh) == 1) | (np.array(shadm) == 1))
