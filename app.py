@@ -1,4 +1,4 @@
-# app.py — Psychiatric Dropout Risk with Safety Override
+# app.py — Psychiatric Dropout Risk with fuzzy override + SHAP + Actions + Batch
 import os
 import streamlit as st
 import pandas as pd
@@ -17,7 +17,7 @@ except Exception:
 st.set_page_config(page_title="Psychiatric Dropout Risk", layout="wide")
 st.title("🧠 Psychiatric Dropout Risk Predictor")
 
-# ====== UI choice lists ======
+# ====== UI 選項 ======
 DIAG_LIST = [
     "Schizophrenia","Bipolar","Depression","Personality Disorder",
     "Substance Use Disorder","Dementia","Anxiety","PTSD","OCD","ADHD","Other/Unknown"
@@ -25,7 +25,7 @@ DIAG_LIST = [
 BIN_YESNO = ["Yes","No"]
 GENDER_LIST = ["Male","Female"]
 
-# ====== Load model or build synthetic ======
+# ====== 載入模型或建立示範模型 ======
 def try_load_model(path="dropout_model.pkl"):
     if not os.path.exists(path):
         return None, None
@@ -41,13 +41,12 @@ def resolve_template_columns(model, pretrained_cols):
         return list(pretrained_cols)
     try:
         booster = getattr(model, "get_booster", lambda: None)()
-        if booster is not None and getattr(booster, "feature_names", None):
+        if booster and getattr(booster, "feature_names", None):
             return list(booster.feature_names)
     except Exception:
         pass
     if hasattr(model, "feature_names_in_"):
         return list(model.feature_names_in_)
-    # fallback from UI
     cols = [
         "age","length_of_stay","num_previous_admissions",
         "medication_compliance_score","family_support_score","post_discharge_followups",
@@ -63,7 +62,7 @@ TEMPLATE_COLUMNS = resolve_template_columns(model, pretrained_cols)
 
 if model is None:
     import xgboost as xgb
-    st.warning("⚠️ dropout_model.pkl not found — building a synthetic demo model.")
+    st.warning("⚠️ 沒找到模型，建立合成示範模型")
     rng = np.random.default_rng(42)
     n = 2000
     X = pd.DataFrame(0, index=range(n), columns=TEMPLATE_COLUMNS, dtype=float)
@@ -82,34 +81,27 @@ if model is None:
     pick_one("has_social_worker", BIN_YESNO)
     pick_one("has_recent_self_harm", BIN_YESNO)
     pick_one("self_harm_during_admission", BIN_YESNO)
-    logit = -2 + 1.3*X["has_recent_self_harm_Yes"] + 0.9*X["self_harm_during_admission_Yes"] \
-            - 0.3*X["medication_compliance_score"] + 0.4*(X["num_previous_admissions"]>=1)
+    logit = -2 + 1.3*X["has_recent_self_harm_Yes"] + 0.9*X["self_harm_during_admission_Yes"]
     p = 1/(1+np.exp(-logit))
     y = (rng.random(n) < p).astype(int)
-    model = xgboost.XGBClassifier(
-        n_estimators=300, max_depth=4, subsample=0.9, colsample_bytree=0.8,
-        learning_rate=0.06, eval_metric="logloss", random_state=42
-    )
+    model = xgb.XGBClassifier(n_estimators=300, max_depth=4, learning_rate=0.06)
     model.fit(X, y)
 
-# ====== Risk scoring ======
+# ====== 風險分數計算 ======
 MOD_CUT = 30
 HIGH_CUT = 50
-def proba_to_percent(p: float) -> float: return float(p) * 100.0
-def proba_to_score(p: float) -> int:     return int(round(proba_to_percent(p)))
-def classify(score: int) -> str:
+def proba_to_percent(p): return float(p) * 100
+def proba_to_score(p): return int(round(proba_to_percent(p)))
+def classify(score):
     if score >= HIGH_CUT: return "High"
     if score >= MOD_CUT:  return "Moderate"
     return "Low"
-def _sigmoid(z): return 1.0 / (1.0 + np.exp(-z))
-def _logit(p):   return np.log(np.clip(p,1e-8,1-1e-8)/np.clip(1-p,1e-8,1-1e-8))
-def recalibrate_probability(row: pd.Series, base_prob: float) -> float:
-    z = _logit(base_prob)
-    if int(row.get('has_recent_self_harm_Yes', 0)) == 1: z += 1.5
-    if int(row.get('self_harm_during_admission_Yes', 0)) == 1: z += 1.0
-    return float(_sigmoid(z))
 
-# ====== Sidebar ======
+# 模糊搜尋欄位值
+def has_flag(row, keyword):
+    return any((row[col] == 1) for col in row.index if keyword in col)
+
+# ====== Sidebar 輸入 ======
 with st.sidebar:
     st.header("Patient Info")
     age = st.slider("Age", 18, 90, 35)
@@ -117,14 +109,14 @@ with st.sidebar:
     diagnosis = st.selectbox("Diagnosis", DIAG_LIST)
     length_of_stay = st.slider("Length of Stay (days)", 1, 90, 10)
     num_adm = st.slider("Previous Admissions (1y)", 0, 15, 1)
-    social_worker = st.radio("Has Social Worker", BIN_YESNO, horizontal=True)
-    compliance = st.slider("Medication Compliance Score (0–10)", 0.0, 10.0, 5.0, 0.1)
-    recent_self_harm = st.radio("Recent Self-harm", BIN_YESNO, horizontal=True)
-    selfharm_adm = st.radio("Self-harm During Admission", BIN_YESNO, horizontal=True)
-    support = st.slider("Family Support Score (0–10)", 0.0, 10.0, 5.0, 0.1)
-    followups = st.slider("Post-discharge Followups (booked)", 0, 10, 2)
+    social_worker = st.radio("Has Social Worker", BIN_YESNO)
+    compliance = st.slider("Medication Compliance Score (0–10)", 0.0, 10.0, 5.0)
+    recent_self_harm = st.radio("Recent Self-harm", BIN_YESNO)
+    selfharm_adm = st.radio("Self-harm During Admission", BIN_YESNO)
+    support = st.slider("Family Support Score (0–10)", 0.0, 10.0, 5.0)
+    followups = st.slider("Post-discharge Followups", 0, 10, 2)
 
-# ====== Build X_final ======
+# ====== 建立 X_final ======
 X_final = pd.DataFrame(0, index=[0], columns=TEMPLATE_COLUMNS, dtype=float)
 assign_map = {
     "age": age,
@@ -135,7 +127,8 @@ assign_map = {
     "post_discharge_followups": int(followups),
 }
 for k, v in assign_map.items():
-    if k in X_final.columns: X_final.at[0, k] = v
+    if k in X_final.columns:
+        X_final.at[0, k] = v
 for col in [
     f"gender_{gender}",
     f"diagnosis_{diagnosis}",
@@ -143,22 +136,22 @@ for col in [
     f"has_recent_self_harm_{recent_self_harm}",
     f"self_harm_during_admission_{selfharm_adm}",
 ]:
-    if col in X_final.columns: X_final.at[0, col] = 1
+    if col in X_final.columns:
+        X_final.at[0, col] = 1
 
-# ====== Predict & Safety Override ======
+# ====== 預測 + Safety Override ======
 base_prob = model.predict_proba(X_final, validate_features=False)[0][1]
-adj_prob  = recalibrate_probability(X_final.iloc[0], base_prob)
-percent, score = proba_to_percent(adj_prob), proba_to_score(adj_prob)
+percent, score = proba_to_percent(base_prob), proba_to_score(base_prob)
 level = classify(score)
-
 override_reason = None
-if int(X_final.iloc[0].get('has_recent_self_harm_Yes', 0)) == 1:
+if has_flag(X_final.iloc[0], 'has_recent_self_harm'):
     percent, score, level = 70.0, 70, "High"
     override_reason = "recent self-harm"
-elif int(X_final.iloc[0].get('self_harm_during_admission_Yes', 0)) == 1:
+elif has_flag(X_final.iloc[0], 'self_harm_during_admission'):
     percent, score, level = 70.0, 70, "High"
     override_reason = "in-hospital self-harm"
 
+# ====== 顯示結果 ======
 st.subheader("Predicted Dropout Risk (within 3 months)")
 c1, c2 = st.columns(2)
 with c1: st.metric("Probability", f"{percent:.1f}%")
@@ -190,7 +183,7 @@ with st.expander("SHAP Explanation", expanded=True):
     shap.plots.waterfall(exp, max_display=12, show=False)
     st.pyplot(plt.gcf(), clear_figure=True)
 
-# ====== Actions ======
+# ====== Recommended Actions ======
 st.subheader("Recommended Actions")
 BASE_ACTIONS = {
     "High": [
@@ -203,7 +196,7 @@ BASE_ACTIONS = {
 }
 def personalized_actions(row: pd.Series):
     acts = []
-    if int(row.get('has_recent_self_harm_Yes',0))==1:
+    if has_flag(row, 'has_recent_self_harm'):
         acts += [("Today","Clinician","C-SSRS assessment; update safety plan.")]
     return acts
 rows = BASE_ACTIONS[level] + personalized_actions(X_final.iloc[0])
@@ -270,9 +263,8 @@ if uploaded is not None:
         base_probs = model.predict_proba(Xb, validate_features=False)[:, 1]
         adj_probs = []
         for i in range(len(Xb)):
-            bp = recalibrate_probability(Xb.iloc[i], base_probs[i])
-            # Safety override for batch
-            if int(Xb.iloc[i].get('has_recent_self_harm_Yes', 0)) == 1 or int(Xb.iloc[i].get('self_harm_during_admission_Yes', 0)) == 1:
+            bp = base_probs[i]
+            if has_flag(Xb.iloc[i], 'has_recent_self_harm') or has_flag(Xb.iloc[i], 'self_harm_during_admission'):
                 bp = 0.70
             adj_probs.append(bp)
         out = raw.copy()
