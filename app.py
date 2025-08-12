@@ -1,4 +1,4 @@
-# app.py — Psychiatric Dropout Risk with fuzzy override + SHAP + Actions + Batch
+# app.py — Psychiatric Dropout Risk with fuzzy one-hot + Safety Override + SHAP + Actions + Batch
 import os
 import streamlit as st
 import pandas as pd
@@ -87,7 +87,15 @@ if model is None:
     model = xgb.XGBClassifier(n_estimators=300, max_depth=4, learning_rate=0.06)
     model.fit(X, y)
 
-# ====== 風險分數計算 ======
+# ====== 工具函數 ======
+def set_onehot_by_prefix(df, prefix, value):
+    """模糊匹配設定 one-hot 欄位值"""
+    target = f"{prefix}_{value}".lower()
+    for col in df.columns:
+        if col.lower() == target:
+            df.at[0, col] = 1
+            return
+
 MOD_CUT = 30
 HIGH_CUT = 50
 def proba_to_percent(p): return float(p) * 100
@@ -97,7 +105,6 @@ def classify(score):
     if score >= MOD_CUT:  return "Moderate"
     return "Low"
 
-# 模糊搜尋欄位值
 def has_flag(row, keyword):
     return any((row[col] == 1) for col in row.index if keyword in col)
 
@@ -116,9 +123,9 @@ with st.sidebar:
     support = st.slider("Family Support Score (0–10)", 0.0, 10.0, 5.0)
     followups = st.slider("Post-discharge Followups", 0, 10, 2)
 
-# ====== 建立 X_final ======
+# ====== 建立 X_final 並更新 ======
 X_final = pd.DataFrame(0, index=[0], columns=TEMPLATE_COLUMNS, dtype=float)
-assign_map = {
+continuous_map = {
     "age": age,
     "length_of_stay": float(length_of_stay),
     "num_previous_admissions": int(num_adm),
@@ -126,18 +133,15 @@ assign_map = {
     "family_support_score": float(support),
     "post_discharge_followups": int(followups),
 }
-for k, v in assign_map.items():
+for k, v in continuous_map.items():
     if k in X_final.columns:
         X_final.at[0, k] = v
-for col in [
-    f"gender_{gender}",
-    f"diagnosis_{diagnosis}",
-    f"has_social_worker_{social_worker}",
-    f"has_recent_self_harm_{recent_self_harm}",
-    f"self_harm_during_admission_{selfharm_adm}",
-]:
-    if col in X_final.columns:
-        X_final.at[0, col] = 1
+
+set_onehot_by_prefix(X_final, "gender", gender)
+set_onehot_by_prefix(X_final, "diagnosis", diagnosis)
+set_onehot_by_prefix(X_final, "has_social_worker", social_worker)
+set_onehot_by_prefix(X_final, "has_recent_self_harm", recent_self_harm)
+set_onehot_by_prefix(X_final, "self_harm_during_admission", selfharm_adm)
 
 # ====== 預測 + Safety Override ======
 base_prob = model.predict_proba(X_final, validate_features=False)[0][1]
@@ -183,30 +187,49 @@ with st.expander("SHAP Explanation", expanded=True):
     )
     shap.plots.waterfall(exp, max_display=12, show=False)
     st.pyplot(plt.gcf(), clear_figure=True)
-
 # ====== Recommended Actions ======
 st.subheader("Recommended Actions")
 BASE_ACTIONS = {
     "High": [
         ("Today","Clinic scheduler","Book return within 7 days."),
-        ("Today","Social worker","Enroll in CM."),
+        ("Today","Social worker","Enroll in case management."),
         ("Today","Clinician","Safety plan + crisis hotline."),
     ],
-    "Moderate": [("1–2 weeks","Clinic scheduler","Schedule return.")],
-    "Low": [("2–4 weeks","Clinic scheduler","Routine follow-up.")],
+    "Moderate": [
+        ("1–2 weeks","Clinic scheduler","Schedule return."),
+        ("1–2 weeks","Nurse","Check adherence barriers.")
+    ],
+    "Low": [
+        ("2–4 weeks","Clinic scheduler","Routine follow-up."),
+        ("2–4 weeks","Nurse","Provide education materials.")
+    ],
 }
 def personalized_actions(row: pd.Series):
     acts = []
     if has_flag(row, 'has_recent_self_harm'):
         acts += [("Today","Clinician","C-SSRS assessment; update safety plan.")]
+    if has_flag(row, 'self_harm_during_admission'):
+        acts += [("Today","Clinician","Immediate psychiatric evaluation.")]
     return acts
+
 rows = BASE_ACTIONS[level] + personalized_actions(X_final.iloc[0])
 seen, uniq = set(), []
 for r in rows:
     if r not in seen:
-        seen.add(r); uniq.append(r)
-for tl, ow, ac in uniq:
-    st.markdown(f"**{tl}** | {ow} | {ac}")
+        seen.add(r)
+        uniq.append(r)
+
+# 三欄卡片顯示
+c_timeline, c_owner, c_action = st.columns([1,1,3])
+with c_timeline:
+    st.markdown("**Timeline**")
+    for tl, _, _ in uniq: st.write(tl)
+with c_owner:
+    st.markdown("**Owner**")
+    for _, ow, _ in uniq: st.write(ow)
+with c_action:
+    st.markdown("**Action**")
+    for _, _, ac in uniq: st.write(ac)
 
 # ====== SOP export ======
 if level == "High":
@@ -214,9 +237,13 @@ if level == "High":
         lines = ["Psychiatric Dropout Risk – SOP", f"Risk score: {score}/100 | Risk level: {label}", ""]
         for (tl, ow, ac) in actions:
             lines.append(f"- {tl} | {ow} | {ac}")
-        buf = BytesIO("\n".join(lines).encode("utf-8")); buf.seek(0); return buf
+        buf = BytesIO("\n".join(lines).encode("utf-8"))
+        buf.seek(0)
+        return buf
+
     st.download_button("⬇️ Export SOP (TXT)", make_sop_txt(score, level, uniq),
                        file_name="dropout_risk_SOP.txt", mime="text/plain")
+
     if HAS_DOCX:
         def make_sop_docx(score: int, label: str, actions: list) -> BytesIO:
             doc = Document()
@@ -224,11 +251,15 @@ if level == "High":
             doc.add_paragraph(f"Risk score: {score}/100 | Risk level: {label}")
             t = doc.add_table(rows=1, cols=3)
             hdr = t.rows[0].cells
-            hdr[0].text='Timeline'; hdr[1].text='Owner'; hdr[2].text='Action'
+            hdr[0].text = 'Timeline'; hdr[1].text = 'Owner'; hdr[2].text = 'Action'
             for (tl, ow, ac) in actions:
                 r = t.add_row().cells
-                r[0].text=tl; r[1].text=ow; r[2].text=ac
-            buf = BytesIO(); doc.save(buf); buf.seek(0); return buf
+                r[0].text = tl; r[1].text = ow; r[2].text = ac
+            buf = BytesIO()
+            doc.save(buf)
+            buf.seek(0)
+            return buf
+
         st.download_button("⬇️ Export SOP (Word)", make_sop_docx(score, level, uniq),
                            file_name="dropout_risk_SOP.docx",
                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
@@ -236,30 +267,41 @@ if level == "High":
 # ====== Batch prediction ======
 st.markdown("---")
 st.subheader("Batch Prediction (Excel)")
+
+# 提供模板下載
 tpl_buf = BytesIO()
 pd.DataFrame(columns=TEMPLATE_COLUMNS).to_excel(tpl_buf, index=False)
 tpl_buf.seek(0)
 st.download_button("📥 Download Excel Template", tpl_buf, file_name="template_columns.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+# 上傳批次檔
 uploaded = st.file_uploader("📂 Upload Excel", type=["xlsx"])
 if uploaded is not None:
     try:
         raw = pd.read_excel(uploaded)
         df = raw.copy()
+
+        # 確保模板欄位齊全
         for c in TEMPLATE_COLUMNS:
-            if c not in df.columns: df[c] = 0
-        for colmap, prefix in {
-            "Gender": "gender",
-            "Diagnosis": "diagnosis",
-            "Has Social Worker": "has_social_worker",
-            "Recent Self-harm": "has_recent_self_harm",
-            "Self-harm During Admission": "self_harm_during_admission"
-        }.items():
-            if colmap in df.columns:
-                for i, v in df[colmap].astype(str).items():
+            if c not in df.columns:
+                df[c] = 0
+
+        # 人類可讀欄位轉 one-hot
+        def apply_onehot_prefix(colname, prefix):
+            if colname in df.columns:
+                for i, v in df[colname].astype(str).items():
                     onehot = f"{prefix}_{v}"
-                    if onehot in df.columns: df.at[i, onehot] = 1
+                    for col in df.columns:
+                        if col.lower() == onehot.lower():
+                            df.at[i, col] = 1
+        apply_onehot_prefix("Gender", "gender")
+        apply_onehot_prefix("Diagnosis", "diagnosis")
+        apply_onehot_prefix("Has Social Worker", "has_social_worker")
+        apply_onehot_prefix("Recent Self-harm", "has_recent_self_harm")
+        apply_onehot_prefix("Self-harm During Admission", "self_harm_during_admission")
+
+        # 預測 + 安全覆蓋
         Xb = df[TEMPLATE_COLUMNS]
         base_probs = model.predict_proba(Xb, validate_features=False)[:, 1]
         adj_probs = []
@@ -268,12 +310,18 @@ if uploaded is not None:
             if has_flag(Xb.iloc[i], 'has_recent_self_harm') or has_flag(Xb.iloc[i], 'self_harm_during_admission'):
                 bp = 0.70
             adj_probs.append(bp)
+
         out = raw.copy()
-        out["risk_percent"] = (np.array(adj_probs)*100).round(1)
-        out["risk_score_0_100"] = (np.array(adj_probs)*100).round().astype(int)
+        out["risk_percent"] = (np.array(adj_probs) * 100).round(1)
+        out["risk_score_0_100"] = (np.array(adj_probs) * 100).round().astype(int)
         out["risk_level"] = [classify(s) for s in out["risk_score_0_100"]]
+
         st.dataframe(out)
-        buf_out = BytesIO(); out.to_csv(buf_out, index=False); buf_out.seek(0)
+
+        buf_out = BytesIO()
+        out.to_csv(buf_out, index=False)
+        buf_out.seek(0)
         st.download_button("⬇️ Download Results (CSV)", buf_out, "predictions.csv", "text/csv")
     except Exception as e:
         st.error(f"Error: {e}")
+
