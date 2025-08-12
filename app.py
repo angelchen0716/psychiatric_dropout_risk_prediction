@@ -1,4 +1,4 @@
-# app.py — Psychiatric Dropout Risk (literature-weighted synthetic training + SHAP + Actions + Batch + robust alignment)
+# app.py — Psychiatric Dropout Risk (fix SHAP names by training with DataFrame + use DF for SHAP)
 import os
 import streamlit as st
 import pandas as pd
@@ -17,7 +17,7 @@ except Exception:
 st.set_page_config(page_title="Psychiatric Dropout Risk", layout="wide")
 st.title("🧠 Psychiatric Dropout Risk Predictor")
 
-# ====== Unified options (match sidebar/Excel/SHAP) ======
+# ====== Unified options ======
 DIAG_LIST = [
     "Schizophrenia","Bipolar","Depression","Personality Disorder",
     "Substance Use Disorder","Dementia","Anxiety","PTSD","OCD","ADHD","Other/Unknown"
@@ -25,7 +25,7 @@ DIAG_LIST = [
 BIN_YESNO = ["Yes","No"]
 GENDER_LIST = ["Male","Female"]
 
-# ====== Feature template (semantic match with UI) ======
+# ====== Feature template ======
 TEMPLATE_COLUMNS = [
     "age","length_of_stay","num_previous_admissions",
     "medication_compliance_score","family_support_score","post_discharge_followups",
@@ -36,7 +36,7 @@ TEMPLATE_COLUMNS = [
     "self_harm_during_admission_Yes","self_harm_during_admission_No",
 ]
 
-# ====== Load model or train from literature-weighted synthetic data ======
+# ====== Load or train ======
 def try_load_model(path="dropout_model.pkl"):
     if not os.path.exists(path):
         return None
@@ -53,7 +53,7 @@ if model is None:
     n = 8000
     X = pd.DataFrame(0, index=range(n), columns=TEMPLATE_COLUMNS, dtype=np.float32)
 
-    # Marginals (adjustable)
+    # marginals
     X["age"] = rng.integers(16, 85, n)
     X["length_of_stay"] = rng.normal(5.0, 3.0, n).clip(0, 45)
     X["num_previous_admissions"] = rng.poisson(0.6, n).clip(0, 10)
@@ -72,7 +72,7 @@ if model is None:
     pick_one("has_recent_self_harm", BIN_YESNO)
     pick_one("self_harm_during_admission", BIN_YESNO)
 
-    # Literature-inspired logit weights
+    # literature-inspired logits
     beta0 = -1.20
     beta = {
         "has_recent_self_harm_Yes": 1.50,
@@ -103,9 +103,7 @@ if model is None:
         + beta["has_social_worker_Yes"]          * X["has_social_worker_Yes"]
     )
     for d, w in beta_diag.items():
-        col = f"diagnosis_{d}"
-        if col in X.columns:
-            logit = logit + w * X[col]
+        logit = logit + w * X[f"diagnosis_{d}"]
 
     noise = rng.normal(0.0, 0.35, n).astype(np.float32)
     logit = logit + noise
@@ -119,9 +117,10 @@ if model is None:
         random_state=42, tree_method="hist",
         objective="binary:logistic", eval_metric="logloss",
     )
-    model.fit(X.values.astype(np.float32), y)
+    # ⭐ 變更1：用 DataFrame（含欄名）訓練，保留 feature_names
+    model.fit(X, y)
 
-# ====== Model-feature alignment helpers (avoid XGBoost columnar pitfalls) ======
+# ====== alignment helpers ======
 def get_model_feature_order(m):
     order = None; exp_len = None
     try:
@@ -158,7 +157,7 @@ def align_df_to_model(df: pd.DataFrame, m):
 def to_float32_np(df: pd.DataFrame):
     return df.astype(np.float32).values
 
-# ====== Small helpers ======
+# ====== helpers ======
 def set_onehot_by_prefix(df, prefix, value):
     col = f"{prefix}_{value}"
     if col in df.columns:
@@ -177,7 +176,7 @@ def classify(score):
     if score >= MOD_CUT:  return "Moderate"
     return "Low"
 
-# ====== Sidebar (single-patient input) ======
+# ====== Sidebar ======
 with st.sidebar:
     st.header("Patient Info")
     age = st.slider("Age", 18, 90, 35)
@@ -192,7 +191,7 @@ with st.sidebar:
     support = st.slider("Family Support Score (0–10)", 0.0, 10.0, 5.0)
     followups = st.slider("Post-discharge Followups", 0, 10, 2)
 
-# ====== Build X (single) ======
+# ====== Build single-row DF ======
 X_final = pd.DataFrame(0, index=[0], columns=TEMPLATE_COLUMNS, dtype=float)
 for k, v in {
     "age": age,
@@ -209,7 +208,7 @@ set_onehot_by_prefix(X_final, "has_social_worker", social_worker)
 set_onehot_by_prefix(X_final, "has_recent_self_harm", recent_self_harm)
 set_onehot_by_prefix(X_final, "self_harm_during_admission", selfharm_adm)
 
-# ====== Predict (align features + float32 + validate_features=False) ======
+# ====== Predict ======
 X_aligned_df, used_names = align_df_to_model(X_final, model)
 X_np = to_float32_np(X_aligned_df)
 base_prob = model.predict_proba(X_np, validate_features=False)[:, 1][0]
@@ -237,18 +236,23 @@ elif level == "Moderate":
 else:
     st.success("🟢 Low Risk")
 
-# ====== SHAP (grouped display, English captions) ======
+# ====== SHAP ======
 with st.expander("SHAP Explanation", expanded=True):
     st.caption("How to read: positive bars push toward higher dropout risk; negative bars lower it. Only the selected category for each one-hot feature is shown.")
+    # ⭐ 變更2：用『有欄名的 DataFrame』做 SHAP（避免只有一個特徵）
     explainer = shap.TreeExplainer(model)
-    sv_raw = explainer.shap_values(X_np)
+    sv_raw = explainer.shap_values(X_aligned_df)   # <= 傳入 DataFrame，不要 numpy
     base_value = explainer.expected_value
     if isinstance(base_value, (list, np.ndarray)) and not np.isscalar(base_value):
         base_value = base_value[0]
         if isinstance(sv_raw, list): sv_raw = sv_raw[0]
-    sv_raw = sv_raw[0]
+    sv_raw = sv_raw[0]  # (n_features,)
+
+    # 對應回欄名
+    used_names = list(X_aligned_df.columns)
     sv_map = dict(zip(used_names, sv_raw))
 
+    # 連續特徵
     cont_feats = [
         ("Age","age", X_final.at[0,"age"]),
         ("Length of Stay (days)","length_of_stay", X_final.at[0,"length_of_stay"]),
@@ -262,17 +266,18 @@ with st.expander("SHAP Explanation", expanded=True):
         if key in sv_map:
             names.append(label); vals.append(sv_map[key]); data_vals.append(dv)
 
+    # 類別（只顯示被選中的）
     def add_onehot(title, prefix, value):
         col = f"{prefix}_{value}"
         if col in sv_map:
             names.append(f"{title}={value}"); vals.append(sv_map[col]); data_vals.append(1)
-
     add_onehot("Gender","gender", gender)
     add_onehot("Diagnosis","diagnosis", diagnosis)
     add_onehot("Has Social Worker","has_social_worker", social_worker)
     add_onehot("Recent Self-harm","has_recent_self_harm", recent_self_harm)
     add_onehot("Self-harm During Admission","self_harm_during_admission", selfharm_adm)
 
+    # 顯示前 12 名
     order = np.argsort(np.abs(np.array(vals)))[::-1][:12]
     exp = shap.Explanation(
         values=np.array(vals)[order],
@@ -322,7 +327,7 @@ with c_owner:
 with c_action:
     st.markdown("**Action**");         [st.write(ac) for _,_,ac in uniq]
 
-# ====== SOP export (only when High risk) ======
+# ====== SOP export ======
 if level == "High":
     def make_sop_txt(score: int, label: str, actions: list) -> BytesIO:
         lines = ["Psychiatric Dropout Risk – SOP", f"Risk score: {score}/100 | Risk level: {label}", ""]
