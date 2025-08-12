@@ -531,7 +531,16 @@ BASE_ACTIONS = {
     ],
 }
 
-# ---- 個人化處置（依觸發條件）----
+# 正規化工具（把 3 欄或 4 欄 tuple 統一成 4 欄）
+def _normalize_action_tuple(a):
+    if len(a) == 4:
+        return a
+    elif len(a) == 3:
+        tl, ow, ac = a
+        return (tl, ow, ac, "")
+    else:
+        return None
+
 def add(actions, tl, owner, act, why):
     actions.append((tl, owner, act, why))
 
@@ -633,12 +642,21 @@ base_bucket = {
     "Low–Moderate": "Low",     # 邊帶 → 用下一級基線
     "Low": "Low",
 }
-actions = [(tl, ow, ac, why) for (tl, ow, ac, why) in
-           [(*a, a[3]) if len(a) == 4 else (*a, "") for a in BASE_ACTIONS[base_bucket[level]]]]
 
-# 個人化
+# 基線處置
+_base_list = BASE_ACTIONS[base_bucket[level]]
+actions = []
+for a in _base_list:
+    na = _normalize_action_tuple(a)
+    if na is not None:
+        actions.append(na)
+
+# 個人化處置
 pers = personalized_actions(X_final.iloc[0], diagnoses, level, drivers)
-actions.extend(pers)
+for a in pers:
+    na = _normalize_action_tuple(a)
+    if na is not None:
+        actions.append(na)
 
 # 去重（同樣的三欄動作視為重複）
 seen = set(); uniq = []
@@ -688,6 +706,46 @@ if level in ["High", "Moderate–High"]:
         st.download_button("⬇️ Export SOP (Word)", make_sop_docx(score, level, uniq),
                            file_name="dropout_risk_SOP.docx",
                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
+# ====== （頂層）Batch 用的工具函式：Top-3 推薦處置 ======
+def chosen_dx_for_row(i, df_feat):
+    """回傳第 i 列病人的多重診斷清單（依一熱編碼欄）"""
+    return [d for d in DIAG_LIST if f"diagnosis_{d}" in df_feat.columns and df_feat.at[i, f"diagnosis_{d}"] == 1]
+
+def top3_actions_for_row(i, out_df, features_df):
+    """依風險等級 + 個人化規則，產生 Top-3 推薦處置（含 Why）字串"""
+    level_i = out_df.loc[i, "risk_level"]
+    base_bucket_map = {"High":"High","Moderate–High":"High","Moderate":"Moderate","Low–Moderate":"Low","Low":"Low"}
+    base_lvl = base_bucket_map.get(level_i, "Low")
+
+    # 基線處置（補齊 Why 空字串）
+    acts = []
+    for a in BASE_ACTIONS[base_lvl]:
+        na = _normalize_action_tuple(a)
+        if na is not None:
+            acts.append(na)
+
+    # 個人化處置
+    row_series = features_df.iloc[i]
+    chosen_dx = chosen_dx_for_row(i, features_df)
+    pers = personalized_actions(row_series, chosen_dx, level_i, [])
+    for a in pers:
+        na = _normalize_action_tuple(a)
+        if na is not None:
+            acts.append(na)
+
+    # 去重 + 依時間窗排序
+    seen = set(); uniq = []
+    for a in acts:
+        tl, ow, ac, why = a
+        key = (tl, ow, ac)
+        if key not in seen:
+            seen.add(key); uniq.append((tl, ow, ac, why))
+    ORDER = {"Today": 0, "48h": 1, "7d": 2, "1–7d": 2, "1–2w": 3, "2–4w": 4, "1–4w": 5}
+    uniq.sort(key=lambda x: (ORDER.get(x[0], 99), x[1], x[2]))
+
+    top = [f"{tl} | {ow} | {ac}" + (f" (Why: {why})" if why else "") for (tl, ow, ac, why) in uniq[:3]]
+    return " || ".join(top)
 
 # ====== Batch Prediction (Excel) ======
 st.markdown("---")
@@ -818,7 +876,7 @@ if uploaded is not None:
         levels[s >= HIGH_CUT + BORDER_BAND] = "High"
         out["risk_level"] = levels
 
-        # （已有）policy drivers top3（簡化重現主要項）
+        # policy drivers top3（簡化重現主要項）
         top3_list = []
         for i in range(len(df)):
             contribs = []
@@ -863,34 +921,8 @@ if uploaded is not None:
                 top3_list.append(" | ".join(top3))
         out["policy_drivers_top3"] = top3_list
 
-        # ---- (NEW) Recommended actions Top-3 per row ----
-        def _chosen_dx_for_row(i):
-            return [d for d in DIAG_LIST if f"diagnosis_{d}" in df.columns and df.at[i, f"diagnosis_{d}"] == 1]
-
-        def _top3_actions_for_row(i):
-            level_i = out.loc[i, "risk_level"]
-            base_bucket = {"High":"High","Moderate–High":"High","Moderate":"Moderate","Low–Moderate":"Low","Low":"Low"}
-            base_lvl = base_bucket.get(level_i, "Low")
-            acts = [a if len(a) == 4 else (*a, "") for a in BASE_ACTIONS[base_lvl]]
-            row_series = df.iloc[i]
-            chosen_dx = _chosen_dx_for_row(i)
-            pers = personalized_actions(row_series, chosen_dx, level_i, [])
-            acts.extend(pers)
-
-            seen = set(); uniq = []
-            for a in acts:
-                tl, ow, ac, *rest = a
-                why = rest[0] if rest else ""
-                key = (tl, ow, ac)
-                if key not in seen:
-                    seen.add(key); uniq.append((tl, ow, ac, why))
-            ORDER = {"Today": 0, "48h": 1, "7d": 2, "1–7d": 2, "1–2w": 3, "2–4w": 4, "1–4w": 5}
-            uniq.sort(key=lambda x: (ORDER.get(x[0], 99), x[1], x[2]))
-
-            top = [f"{tl} | {ow} | {ac}" + (f" (Why: {why})" if why else "") for (tl, ow, ac, why) in uniq[:3]]
-            return " || ".join(top)
-
-        out["recommended_actions_top3"] = [ _top3_actions_for_row(i) for i in range(len(out)) ]
+        # 推薦處置 Top-3
+        out["recommended_actions_top3"] = [ top3_actions_for_row(i, out, df) for i in range(len(out)) ]
 
         st.dataframe(out, use_container_width=True)
         buf_out = BytesIO(); out.to_csv(buf_out, index=False); buf_out.seek(0)
