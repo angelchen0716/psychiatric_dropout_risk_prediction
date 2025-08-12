@@ -1,4 +1,4 @@
-# app.py — Psychiatric Dropout Risk (fix SHAP names by training with DataFrame + use DF for SHAP)
+# app.py — Psychiatric Dropout Risk (balanced weights + soft safety override + SHAP + Actions + Batch)
 import os
 import streamlit as st
 import pandas as pd
@@ -36,7 +36,7 @@ TEMPLATE_COLUMNS = [
     "self_harm_during_admission_Yes","self_harm_during_admission_No",
 ]
 
-# ====== Load or train (with auto-fallback to demo if features don't match) ======
+# ====== Load or train (auto-fallback to balanced demo) ======
 def try_load_model(path="dropout_model.pkl"):
     if not os.path.exists(path):
         return None
@@ -48,20 +48,20 @@ def try_load_model(path="dropout_model.pkl"):
     except Exception:
         return None
 
-def train_demo_model(TEMPLATE_COLUMNS):
+def train_demo_model(columns):
     import xgboost as xgb
     rng = np.random.default_rng(42)
     n = 8000
-    X = pd.DataFrame(0, index=range(n), columns=TEMPLATE_COLUMNS, dtype=np.float32)
-    # marginals
+    X = pd.DataFrame(0, index=range(n), columns=columns, dtype=np.float32)
+
+    # Marginals
     X["age"] = rng.integers(16, 85, n)
     X["length_of_stay"] = rng.normal(5.0, 3.0, n).clip(0, 45)
-    X["num_previous_admissions"] = rng.poisson(0.6, n).clip(0, 10)
-    X["medication_compliance_score"] = rng.normal(6.0, 2.2, n).clip(0, 10)
+    X["num_previous_admissions"] = rng.poisson(0.8, n).clip(0, 12)
+    X["medication_compliance_score"] = rng.normal(6.0, 2.5, n).clip(0, 10)
     X["family_support_score"] = rng.normal(5.0, 2.5, n).clip(0, 10)
     X["post_discharge_followups"] = rng.integers(0, 6, n)
 
-    # one-hot pickers
     def pick_one(prefix, options):
         idx = rng.integers(0, len(options), n)
         for i, opt in enumerate(options):
@@ -72,53 +72,53 @@ def train_demo_model(TEMPLATE_COLUMNS):
     pick_one("has_recent_self_harm", BIN_YESNO)
     pick_one("self_harm_during_admission", BIN_YESNO)
 
-    # literature-inspired logits
-    beta0 = -1.20
+    # ===== Balanced literature-inspired logits =====
+    beta0 = -0.90  # overall prevalence ~30%
     beta = {
-        "has_recent_self_harm_Yes": 1.50,
-        "self_harm_during_admission_Yes": 1.20,
-        "prev_adm_ge2": 0.50,
-        "medication_compliance_per_point": -0.12,
-        "family_support_per_point": -0.10,
-        "followups_per_visit": -0.08,
-        "length_of_stay_per_day": 0.02,
-        "has_social_worker_Yes": -0.25
+        "has_recent_self_harm_Yes": 0.80,           # ↓ from 1.50
+        "self_harm_during_admission_Yes": 0.60,     # ↓ from 1.20
+        "prev_adm_ge2": 0.60,                       # ↑ slightly
+        "medication_compliance_per_point": -0.25,   # ↑ magnitude
+        "family_support_per_point": -0.20,          # ↑ magnitude
+        "followups_per_visit": -0.12,               # ↑ magnitude
+        "length_of_stay_per_day": 0.05,             # ↑ magnitude
+        "has_social_worker_Yes": -0.25              # keep
     }
     beta_diag = {
-        "Schizophrenia": 0.40,"Bipolar": 0.35,"Depression": 0.25,"Personality Disorder": 0.30,
-        "Substance Use Disorder": 0.35,"Dementia": 0.15,"Anxiety": 0.15,"PTSD": 0.20,
-        "OCD": 0.10,"ADHD": 0.10,"Other/Unknown": 0.10,
+        "Schizophrenia": 0.40, "Bipolar": 0.35, "Depression": 0.25,
+        "Personality Disorder": 0.30, "Substance Use Disorder": 0.35,
+        "Dementia": 0.15, "Anxiety": 0.15, "PTSD": 0.20, "OCD": 0.10, "ADHD": 0.10,
+        "Other/Unknown": 0.10,
     }
+
     prev_ge2 = (X["num_previous_admissions"] >= 2).astype(np.float32)
     logit = (
         beta0
-        + beta["has_recent_self_harm_Yes"]       * X["has_recent_self_harm_Yes"]
-        + beta["self_harm_during_admission_Yes"] * X["self_harm_during_admission_Yes"]
-        + beta["prev_adm_ge2"]                   * prev_ge2
-        + beta["medication_compliance_per_point"]* X["medication_compliance_score"]
-        + beta["family_support_per_point"]       * X["family_support_score"]
-        + beta["followups_per_visit"]            * X["post_discharge_followups"]
-        + beta["length_of_stay_per_day"]         * X["length_of_stay"]
-        + beta["has_social_worker_Yes"]          * X["has_social_worker_Yes"]
+        + beta["has_recent_self_harm_Yes"]        * X["has_recent_self_harm_Yes"]
+        + beta["self_harm_during_admission_Yes"]  * X["self_harm_during_admission_Yes"]
+        + beta["prev_adm_ge2"]                    * prev_ge2
+        + beta["medication_compliance_per_point"] * X["medication_compliance_score"]
+        + beta["family_support_per_point"]        * X["family_support_score"]
+        + beta["followups_per_visit"]             * X["post_discharge_followups"]
+        + beta["length_of_stay_per_day"]          * X["length_of_stay"]
+        + beta["has_social_worker_Yes"]           * X["has_social_worker_Yes"]
     )
     for d, w in beta_diag.items():
         logit = logit + w * X[f"diagnosis_{d}"]
-    noise = rng.normal(0.0, 0.35, n).astype(np.float32)
+
+    noise = rng.normal(0.0, 0.35, n).astype(np.float32)  # keep model lively
     p = 1.0 / (1.0 + np.exp(-(logit + noise)))
     y = (rng.random(n) < p).astype(np.int32)
 
     model = xgb.XGBClassifier(
-        n_estimators=400, max_depth=4, learning_rate=0.06,
+        n_estimators=450, max_depth=4, learning_rate=0.06,
         subsample=0.9, colsample_bytree=0.9, reg_lambda=1.0,
         random_state=42, tree_method="hist",
         objective="binary:logistic", eval_metric="logloss",
     )
-    # 用 DataFrame（含欄名）訓練，保留 feature_names
+    # Train with DataFrame to preserve feature_names
     model.fit(X, y)
     return model
-
-# 先嘗試載入；若特徵不匹配或可解釋度明顯有問題，改用 demo
-model = try_load_model()
 
 def get_feat_names(m):
     try:
@@ -131,22 +131,21 @@ def get_feat_names(m):
         return list(m.feature_names_in_)
     return None
 
+model = try_load_model()
 loaded = model is not None
 use_demo = False
 if model is not None:
     names = get_feat_names(model)
-    # 1) 沒有特徵名、或特徵數差很多 → 視為不相容
     if (names is None) or (abs(len(names) - len(TEMPLATE_COLUMNS)) > 5):
         use_demo = True
 
 if (not loaded) or use_demo:
     model = train_demo_model(TEMPLATE_COLUMNS)
-    model_source = "demo (literature-weighted)"
+    model_source = "demo (balanced weights)"
 else:
     model_source = "loaded from dropout_model.pkl"
 
-
-# ====== alignment helpers ======
+# ====== Alignment helpers ======
 def get_model_feature_order(m):
     order = None; exp_len = None
     try:
@@ -183,7 +182,7 @@ def align_df_to_model(df: pd.DataFrame, m):
 def to_float32_np(df: pd.DataFrame):
     return df.astype(np.float32).values
 
-# ====== helpers ======
+# ====== Small helpers ======
 def set_onehot_by_prefix(df, prefix, value):
     col = f"{prefix}_{value}"
     if col in df.columns:
@@ -193,8 +192,9 @@ def flag_yes(row, prefix):
     col = f"{prefix}_Yes"
     return (col in row.index) and (row[col] == 1)
 
-MOD_CUT = 30
-HIGH_CUT = 50
+# ====== Thresholds (relaxed so non‑self‑harm features can move classes) ======
+MOD_CUT = 20
+HIGH_CUT = 40
 def proba_to_percent(p): return float(p) * 100
 def proba_to_score(p): return int(round(proba_to_percent(p)))
 def classify(score):
@@ -234,25 +234,29 @@ set_onehot_by_prefix(X_final, "has_social_worker", social_worker)
 set_onehot_by_prefix(X_final, "has_recent_self_harm", recent_self_harm)
 set_onehot_by_prefix(X_final, "self_harm_during_admission", selfharm_adm)
 
-# ====== Predict ======
+# ====== Predict (align + float32 + validate_features=False) ======
 X_aligned_df, used_names = align_df_to_model(X_final, model)
 X_np = to_float32_np(X_aligned_df)
 base_prob = model.predict_proba(X_np, validate_features=False)[:, 1][0]
 
-percent, score = proba_to_percent(base_prob), proba_to_score(base_prob)
+# ====== Soft safety override (uplift, not hard lock) ======
+soft_reason = None
+p = float(base_prob)
+if flag_yes(X_final.iloc[0], "has_recent_self_harm") or flag_yes(X_final.iloc[0], "self_harm_during_admission"):
+    # raise probability but keep model influence; floor at 0.60, then +0.15, cap 0.90
+    p = max(p, 0.60)
+    p = min(p + 0.15, 0.90)
+    soft_reason = "self-harm uplift"
+
+percent, score = proba_to_percent(p), proba_to_score(p)
 level = classify(score)
-override_reason = None
-if flag_yes(X_final.iloc[0], "has_recent_self_harm"):
-    percent, score, level = 70.0, 70, "High"; override_reason = "recent self-harm"
-elif flag_yes(X_final.iloc[0], "self_harm_during_admission"):
-    percent, score, level = 70.0, 70, "High"; override_reason = "in-hospital self-harm"
-# ====== Model diagnostics (quick sanity check) ======
+
+# ====== Model diagnostics ======
 with st.expander("Model diagnostics", expanded=False):
     st.write(f"**Model source:** {model_source}")
     try:
         booster = model.get_booster()
-        fmap = booster.get_fscore()  # split counts
-        # 轉為 DataFrame 並依重要性排序
+        fmap = booster.get_fscore()
         imp = (pd.Series(fmap, name="split_count")
                .reindex(get_feat_names(model) or [], fill_value=0)
                .sort_values(ascending=False).head(10))
@@ -261,15 +265,13 @@ with st.expander("Model diagnostics", expanded=False):
     except Exception as e:
         st.caption(f"Importance not available: {e}")
 
-
 # ====== Show result ======
 st.subheader("Predicted Dropout Risk (within 3 months)")
 c1, c2 = st.columns(2)
 with c1: st.metric("Probability", f"{percent:.1f}%")
 with c2: st.metric("Risk Score (0–100)", f"{score}")
-if override_reason:
-    st.error(f"🔴 High Risk (safety override: {override_reason})")
-    st.caption("ℹ️ Determined by a clinical safety override, not purely by the model output.")
+if soft_reason:
+    st.warning(f"🟠 Soft safety uplift applied ({soft_reason}).")
 elif level == "High":
     st.error("🔴 High Risk")
 elif level == "Moderate":
@@ -281,37 +283,27 @@ else:
 with st.expander("SHAP Explanation", expanded=True):
     st.caption("How to read: positive bars push toward higher dropout risk; negative bars lower it. Only the selected category for each one-hot feature is shown.")
     import xgboost as xgb
-    import numpy as np
-    import shap
-    import matplotlib.pyplot as plt
 
     try:
-        # 用 Booster + DMatrix 直接取 SHAP 貢獻；最後一欄是 bias（base value）
         booster = model.get_booster()
         dmat = xgb.DMatrix(X_aligned_df, feature_names=list(X_aligned_df.columns))
         contribs = booster.predict(dmat, pred_contribs=True, validate_features=False)
-        contrib = np.asarray(contribs)[0]              # (n_features + 1,)
-        base_value = float(contrib[-1])                # bias term
-        feat_contrib = contrib[:-1]                    # 對應每個特徵
-        used_names = list(X_aligned_df.columns)
-        sv_map = dict(zip(used_names, feat_contrib))
+        contrib = np.asarray(contribs)[0]          # (n_features + 1,)
+        base_value = float(contrib[-1])
+        feat_contrib = contrib[:-1]
+        sv_map = dict(zip(list(X_aligned_df.columns), feat_contrib))
     except Exception:
-        # 萬一雲端 xgboost 不支援 pred_contribs，再退回 TreeExplainer（保險）
+        # Fallback to TreeExplainer
         explainer = shap.TreeExplainer(model)
         sv_raw = explainer.shap_values(X_aligned_df)
         base_value = explainer.expected_value
         if isinstance(base_value, (list, np.ndarray)) and not np.isscalar(base_value):
             base_value = base_value[0]
-            if isinstance(sv_raw, list):
-                sv_raw = sv_raw[0]
+            if isinstance(sv_raw, list): sv_raw = sv_raw[0]
         sv_raw = sv_raw[0]
-        used_names = list(X_aligned_df.columns)
-        sv_map = dict(zip(used_names, sv_raw))
+        sv_map = dict(zip(list(X_aligned_df.columns), sv_raw))
 
-    # 把底層特徵貢獻，聚合成「和左側語意一致」的顯示
     names, vals, data_vals = [], [], []
-
-    # 連續特徵（直接顯示）
     cont_feats = [
         ("Age","age", X_final.at[0,"age"]),
         ("Length of Stay (days)","length_of_stay", X_final.at[0,"length_of_stay"]),
@@ -324,21 +316,16 @@ with st.expander("SHAP Explanation", expanded=True):
         if key in sv_map:
             names.append(label); vals.append(float(sv_map[key])); data_vals.append(dv)
 
-    # 類別特徵：只顯示被選中的 one-hot
     def add_onehot(title, prefix, value):
         col = f"{prefix}_{value}"
         if col in sv_map:
-            names.append(f"{title}={value}")
-            vals.append(float(sv_map[col]))
-            data_vals.append(1)
-
+            names.append(f"{title}={value}"); vals.append(float(sv_map[col])); data_vals.append(1)
     add_onehot("Gender","gender", gender)
     add_onehot("Diagnosis","diagnosis", diagnosis)
     add_onehot("Has Social Worker","has_social_worker", social_worker)
     add_onehot("Recent Self-harm","has_recent_self_harm", recent_self_harm)
     add_onehot("Self-harm During Admission","self_harm_during_admission", selfharm_adm)
 
-    # 依絕對值排序顯示前 12 名
     order = np.argsort(np.abs(np.array(vals)))[::-1][:12]
     exp = shap.Explanation(
         values=np.array(vals, dtype=float)[order],
@@ -348,7 +335,6 @@ with st.expander("SHAP Explanation", expanded=True):
     )
     shap.plots.waterfall(exp, show=False, max_display=12)
     st.pyplot(plt.gcf(), clear_figure=True)
-
 
 # ====== Recommended Actions ======
 st.subheader("Recommended Actions")
@@ -389,7 +375,7 @@ with c_owner:
 with c_action:
     st.markdown("**Action**");         [st.write(ac) for _,_,ac in uniq]
 
-# ====== SOP export ======
+# ====== SOP export (High only) ======
 if level == "High":
     def make_sop_txt(score: int, label: str, actions: list) -> BytesIO:
         lines = ["Psychiatric Dropout Risk – SOP", f"Risk score: {score}/100 | Risk level: {label}", ""]
@@ -456,14 +442,16 @@ if uploaded is not None:
         apply_onehot_prefix("Recent Self-harm","has_recent_self_harm", BIN_YESNO)
         apply_onehot_prefix("Self-harm During Admission","self_harm_during_admission", BIN_YESNO)
 
-        Xb_aligned, used_names_b = align_df_to_model(df, model)
+        Xb_aligned, _ = align_df_to_model(df, model)
         Xb_np = to_float32_np(Xb_aligned)
         base_probs = model.predict_proba(Xb_np, validate_features=False)[:, 1]
 
+        # 同樣使用 soft uplift
         adj_probs = base_probs.copy()
         yes_recent = (df["has_recent_self_harm_Yes"] == 1)
         yes_adm = (df["self_harm_during_admission_Yes"] == 1)
-        adj_probs[yes_recent | yes_adm] = 0.70
+        soft_mask = (yes_recent | yes_adm).values
+        adj_probs[soft_mask] = np.minimum(np.maximum(adj_probs[soft_mask], 0.60) + 0.15, 0.90)
 
         out = raw.copy()
         out["risk_percent"] = (adj_probs * 100).round(1)
