@@ -16,6 +16,35 @@ except Exception:
 
 st.set_page_config(page_title="Psychiatric Dropout Risk", layout="wide")
 st.title("🧠 Psychiatric Dropout Risk Predictor")
+# ==== Policy overlay helpers (logit space) ====
+def _sigmoid(x): 
+    return 1.0 / (1.0 + np.exp(-x))
+
+def _logit(p, eps=1e-6):
+    p = float(np.clip(p, eps, 1 - eps))
+    return np.log(p / (1 - p))
+
+# 可調的政策疊加權重（單位：log-odds）
+POLICY = {
+    "per_prev_admission": 0.10,   # 每一次過去住院 ↑ 0.10（上限 5 次）
+    "per_point_low_compliance": 0.18,  # (5 - 順從) 每 1 分 ↑ 0.18
+    "per_point_low_support": 0.15,     # (5 - 家庭支持) 每 1 分 ↑ 0.15
+    "per_followup": -0.12,        # 每 1 次出院追蹤 ↓ 0.12
+    "social_worker_yes": -0.20,   # 有社工 ↓ 0.20
+    # 住院日數：短/長皆↑；中段影響小
+    "los_short": 0.35,   # <3 天
+    "los_mid": 0.00,     # 3–14 天
+    "los_long": 0.25,    # >21 天（15–21 給輕微↑）
+    "los_mid_high": 0.10,
+    # 診斷疊加（可依場域再調）
+    "diag": {
+        "Schizophrenia": 0.40, "Bipolar": 0.35, "Depression": 0.25,
+        "Personality Disorder": 0.30, "Substance Use Disorder": 0.35,
+        "Dementia": 0.15, "Anxiety": 0.15, "PTSD": 0.20, "OCD": 0.10, 
+        "ADHD": 0.10, "Other/Unknown": 0.10,
+    }
+}
+
 
 # ====== Unified options ======
 DIAG_LIST = [
@@ -234,22 +263,64 @@ set_onehot_by_prefix(X_final, "has_social_worker", social_worker)
 set_onehot_by_prefix(X_final, "has_recent_self_harm", recent_self_harm)
 set_onehot_by_prefix(X_final, "self_harm_during_admission", selfharm_adm)
 
-# ====== Predict (align + float32 + validate_features=False) ======
+# ====== Predict (align + float32 + validate_features=False + policy overlay) ======
 X_aligned_df, used_names = align_df_to_model(X_final, model)
 X_np = to_float32_np(X_aligned_df)
-base_prob = model.predict_proba(X_np, validate_features=False)[:, 1][0]
+p_model = float(model.predict_proba(X_np, validate_features=False)[:, 1][0])
 
-# ====== Soft safety override (uplift, not hard lock) ======
+# ---- Policy overlay on logit space（讓非 self-harm 也能推高風險）----
+lz = _logit(p_model)
+
+# 前次住院次數（最多計 5 次）
+lz += POLICY["per_prev_admission"] * min(int(X_final.at[0, "num_previous_admissions"]), 5)
+
+# 順從度、家庭支持（以 5 為中心）
+lz += POLICY["per_point_low_compliance"] * max(0.0, 5.0 - float(X_final.at[0, "medication_compliance_score"]))
+lz += POLICY["per_point_low_support"] * max(0.0, 5.0 - float(X_final.at[0, "family_support_score"]))
+
+# 出院追蹤次數（保護因子）
+lz += POLICY["per_followup"] * float(X_final.at[0, "post_discharge_followups"])
+
+# 社工（保護因子）
+if X_final.at[0, "has_social_worker_Yes"] == 1:
+    lz += POLICY["social_worker_yes"]
+
+# 住院日數：短/長 ↑ 風險
+los = float(X_final.at[0, "length_of_stay"])
+if los < 3:
+    lz += POLICY["los_short"]
+elif los <= 14:
+    lz += POLICY["los_mid"]
+elif los <= 21:
+    lz += POLICY["los_mid_high"]
+else:
+    lz += POLICY["los_long"]
+
+# 診斷別
+for dx, w in POLICY["diag"].items():
+    col = f"diagnosis_{dx}"
+    if col in X_final.columns and X_final.at[0, col] == 1:
+        lz += w
+        break
+
+# 疊加後的政策機率
+p_policy = _sigmoid(lz)
+
+# ---- Soft safety uplift for self-harm（不鎖死，僅提升）----
 soft_reason = None
-p = float(base_prob)
 if flag_yes(X_final.iloc[0], "has_recent_self_harm") or flag_yes(X_final.iloc[0], "self_harm_during_admission"):
-    # raise probability but keep model influence; floor at 0.60, then +0.15, cap 0.90
-    p = max(p, 0.60)
-    p = min(p + 0.15, 0.90)
+    p_final = min(max(p_policy, 0.60) + 0.15, 0.90)  # floor 0.60, +0.15, cap 0.90
     soft_reason = "self-harm uplift"
+else:
+    p_final = p_policy
 
-percent, score = proba_to_percent(p), proba_to_score(p)
+percent_model = proba_to_percent(p_model)
+percent = proba_to_percent(p_final)
+score = proba_to_score(p_final)
+
+# 門檻（保持你目前設定）
 level = classify(score)
+
 
 # ====== Model diagnostics ======
 with st.expander("Model diagnostics", expanded=False):
@@ -267,9 +338,11 @@ with st.expander("Model diagnostics", expanded=False):
 
 # ====== Show result ======
 st.subheader("Predicted Dropout Risk (within 3 months)")
-c1, c2 = st.columns(2)
-with c1: st.metric("Probability", f"{percent:.1f}%")
-with c2: st.metric("Risk Score (0–100)", f"{score}")
+c1, c2, c3 = st.columns(3)
+with c1: st.metric("Model Probability", f"{percent_model:.1f}%")
+with c2: st.metric("Final Probability", f"{percent:.1f}%")
+with c3: st.metric("Risk Score (0–100)", f"{score}")
+
 if soft_reason:
     st.warning(f"🟠 Soft safety uplift applied ({soft_reason}).")
 elif level == "High":
@@ -278,6 +351,7 @@ elif level == "Moderate":
     st.warning("🟡 Moderate Risk")
 else:
     st.success("🟢 Low Risk")
+
 
 # ====== SHAP (version-agnostic via XGBoost pred_contribs) ======
 with st.expander("SHAP Explanation", expanded=True):
@@ -444,14 +518,47 @@ if uploaded is not None:
 
         Xb_aligned, _ = align_df_to_model(df, model)
         Xb_np = to_float32_np(Xb_aligned)
-        base_probs = model.predict_proba(Xb_np, validate_features=False)[:, 1]
+       # ---- Vectorized policy overlay for batch ----
+def _logit_vec(p, eps=1e-6):
+    p = np.clip(p, eps, 1 - eps)
+    return np.log(p / (1 - p))
 
-        # 同樣使用 soft uplift
-        adj_probs = base_probs.copy()
-        yes_recent = (df["has_recent_self_harm_Yes"] == 1)
-        yes_adm = (df["self_harm_during_admission_Yes"] == 1)
-        soft_mask = (yes_recent | yes_adm).values
-        adj_probs[soft_mask] = np.minimum(np.maximum(adj_probs[soft_mask], 0.60) + 0.15, 0.90)
+lz = _logit_vec(base_probs)
+
+# prev admissions
+lz += POLICY["per_prev_admission"] * np.minimum(df["num_previous_admissions"].astype(float).values, 5)
+
+# compliance & support (center at 5)
+lz += POLICY["per_point_low_compliance"] * np.maximum(0.0, 5.0 - df["medication_compliance_score"].astype(float).values)
+lz += POLICY["per_point_low_support"] * np.maximum(0.0, 5.0 - df["family_support_score"].astype(float).values)
+
+# followups
+lz += POLICY["per_followup"] * df["post_discharge_followups"].astype(float).values
+
+# social worker
+if "has_social_worker_Yes" in df.columns:
+    lz += POLICY["social_worker_yes"] * (df["has_social_worker_Yes"].values == 1)
+
+# LOS
+los = df["length_of_stay"].astype(float).values
+lz += np.where(los < 3, POLICY["los_short"],
+        np.where(los <= 14, POLICY["los_mid"],
+        np.where(los <= 21, POLICY["los_mid_high"], POLICY["los_long"])))
+
+# diagnosis
+diag_term = np.zeros(len(df), dtype=float)
+for dx, w in POLICY["diag"].items():
+    col = f"diagnosis_{dx}"
+    if col in df.columns:
+        diag_term += w * (df[col].values == 1)
+lz += diag_term
+
+p_policy = 1.0 / (1.0 + np.exp(-lz))
+
+# soft uplift for self-harm
+soft_mask = ((df.get("has_recent_self_harm_Yes", 0) == 1) | (df.get("self_harm_during_admission_Yes", 0) == 1)).values
+adj_probs = p_policy.copy()
+adj_probs[soft_mask] = np.minimum(np.maximum(adj_probs[soft_mask], 0.60) + 0.15, 0.90)
 
         out = raw.copy()
         out["risk_percent"] = (adj_probs * 100).round(1)
