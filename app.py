@@ -1,6 +1,7 @@
 # app.py — Psychiatric Dropout Risk
-# (multi-diagnoses + literature-inspired policy overlay + global calibration + smooth blend
+# (multi-diagnoses + null-safe + literature-inspired overlay + global calibration + smooth blend
 #  + border bands + SHAP + Detailed Actions(+Why) + SOP + Batch with drivers & actions top3)
+
 import os
 import re
 import streamlit as st
@@ -51,6 +52,57 @@ TEMPLATE_COLUMNS = [
     "self_harm_during_admission_Yes","self_harm_during_admission_No",
 ]
 
+# ====== Defaults for missing values & cleaners ======
+DEFAULTS = {
+    "age": 40.0,
+    "length_of_stay": 5.0,
+    "num_previous_admissions": 0.0,
+    "medication_compliance_score": 5.0,
+    "family_support_score": 5.0,
+    "post_discharge_followups": 0.0,
+}
+NUMERIC_KEYS = [
+    "age","length_of_stay","num_previous_admissions",
+    "medication_compliance_score","family_support_score","post_discharge_followups"
+]
+def _num_or_default(x, key):
+    try:
+        v = float(x)
+    except Exception:
+        v = np.nan
+    if pd.isna(v):
+        v = DEFAULTS.get(key, 0.0)
+    return v
+def fill_defaults_single_row(X1: pd.DataFrame):
+    """單筆：數值化 + 補齊；至少一個診斷；one-hot NaN→0"""
+    i = X1.index[0]
+    for k in NUMERIC_KEYS:
+        if k in X1.columns:
+            X1.at[i, k] = _num_or_default(X1.at[i, k], k)
+    diag_cols = [c for c in X1.columns if c.startswith("diagnosis_")]
+    if diag_cols and (X1.loc[i, diag_cols].sum() == 0):
+        col = "diagnosis_Other/Unknown"
+        if col in X1.columns:
+            X1.at[i, col] = 1
+    oh_cols = [c for c in X1.columns if "_" in c and c not in NUMERIC_KEYS]
+    if oh_cols:
+        X1.loc[i, oh_cols] = X1.loc[i, oh_cols].fillna(0)
+def fill_defaults_batch(df_feat: pd.DataFrame):
+    """批次：數值化 + 補齊；每列至少一個診斷；one-hot NaN→0"""
+    for k in NUMERIC_KEYS:
+        if k in df_feat.columns:
+            df_feat[k] = pd.to_numeric(df_feat[k], errors="coerce")
+            df_feat[k] = df_feat[k].fillna(DEFAULTS.get(k, 0.0))
+    oh_cols = [c for c in df_feat.columns if "_" in c and c not in NUMERIC_KEYS]
+    if oh_cols:
+        df_feat[oh_cols] = df_feat[oh_cols].fillna(0)
+    diag_cols = [c for c in df_feat.columns if c.startswith("diagnosis_")]
+    if diag_cols:
+        none_diag_mask = (df_feat[diag_cols].sum(axis=1) == 0)
+        col = "diagnosis_Other/Unknown"
+        if col in df_feat.columns:
+            df_feat.loc[none_diag_mask, col] = 1
+
 # ====== Literature-inspired policy overlay weights (log-odds) ======
 POLICY = {
     # 強影響
@@ -80,9 +132,8 @@ POLICY = {
         "ADHD":                    0.00,
         "Other/Unknown":           0.00,
     },
-    # 額外規則
+    # 額外規則/交互效應
     "no_followup_extra": 0.20,          # 0 次追蹤的額外加罰
-    # 交互效應
     "x_sud_lowcomp": 0.15,              # SUD × compliance≤3
     "x_pd_shortlos": 0.10,              # PD × LOS<3
 }
@@ -310,6 +361,9 @@ set_onehot_by_prefix_multi(X_final, "diagnosis", diagnoses)
 set_onehot_by_prefix(X_final, "has_recent_self_harm", recent_self_harm)
 set_onehot_by_prefix(X_final, "self_harm_during_admission", selfharm_adm)
 
+# ✅ Null-safe：補齊缺值 / 至少一個診斷 / one-hot NaN→0
+fill_defaults_single_row(X_final)
+
 # ====== Predict (align + overlay + calibration + blending) ======
 X_aligned_df, used_names = align_df_to_model(X_final, model)
 X_np = to_float32_np(X_aligned_df)
@@ -324,24 +378,27 @@ def add_driver(label, val):
 
 lz = _logit(p_model)
 
+# 取出已補齊的數值（雙保險）
+adm_num = _num_or_default(X_final.at[0, "num_previous_admissions"], "num_previous_admissions")
+comp    = _num_or_default(X_final.at[0, "medication_compliance_score"], "medication_compliance_score")
+supp    = _num_or_default(X_final.at[0, "family_support_score"], "family_support_score")
+fup     = _num_or_default(X_final.at[0, "post_discharge_followups"], "post_discharge_followups")
+los     = _num_or_default(X_final.at[0, "length_of_stay"], "length_of_stay")
+age_v   = _num_or_default(X_final.at[0, "age"], "age")
+
 # 住院史
-lz += add_driver("More previous admissions",
-                 POLICY["per_prev_admission"] * min(int(X_final.at[0, "num_previous_admissions"]), 5))
+lz += add_driver("More previous admissions", POLICY["per_prev_admission"] * min(int(adm_num), 5))
 
 # 順從、家支（以 5 為中心）
-lz += add_driver("Low medication compliance",
-                 POLICY["per_point_low_compliance"] * max(0.0, 5.0 - float(X_final.at[0, "medication_compliance_score"])))
-lz += add_driver("Low family support",
-                 POLICY["per_point_low_support"] * max(0.0, 5.0 - float(X_final.at[0, "family_support_score"])))
+lz += add_driver("Low medication compliance", POLICY["per_point_low_compliance"] * max(0.0, 5.0 - comp))
+lz += add_driver("Low family support", POLICY["per_point_low_support"] * max(0.0, 5.0 - supp))
 
 # 追蹤
-lz += add_driver("More post-discharge followups (protective)",
-                 POLICY["per_followup"] * float(X_final.at[0, "post_discharge_followups"]))
-if float(X_final.at[0, "post_discharge_followups"]) == 0:
+lz += add_driver("More post-discharge followups (protective)", POLICY["per_followup"] * fup)
+if fup == 0:
     lz += add_driver("No follow-up scheduled", POLICY["no_followup_extra"])
 
 # 住院日數
-los = float(X_final.at[0, "length_of_stay"])
 if los < 3:
     lz += add_driver("Very short stay (<3d)", POLICY["los_short"])
 elif los <= 14:
@@ -352,10 +409,9 @@ else:
     lz += add_driver("Very long stay (>21d)", POLICY["los_long"])
 
 # 年齡（極端）
-age_val = float(X_final.at[0, "age"])
-if age_val < 21:
+if age_v < 21:
     lz += add_driver("Young age (<21)", POLICY["age_young"])
-elif age_val >= 75:
+elif age_v >= 75:
     lz += add_driver("Older age (≥75)", POLICY["age_old"])
 
 # 診斷（可複選相加）
@@ -364,10 +420,10 @@ for dx, w in POLICY["diag"].items():
     if col in X_final.columns and X_final.at[0, col] == 1:
         lz += add_driver(f"Diagnosis: {dx}", w)
 
-# 交互效應（用單列 row0 取得純量，避免 Series 布林歧義）
+# 交互效應（row0 取布林）
 row0 = X_final.iloc[0]
 has_sud = bool(row0.get("diagnosis_Substance Use Disorder", 0) == 1)
-if has_sud and float(row0["medication_compliance_score"]) <= 3:
+if has_sud and comp <= 3:
     lz += add_driver("SUD × very low compliance", POLICY["x_sud_lowcomp"])
 has_pd = bool(row0.get("diagnosis_Personality Disorder", 0) == 1)
 if has_pd and los < 3:
@@ -546,12 +602,12 @@ def add(actions, tl, owner, act, why):
 
 def personalized_actions(row: pd.Series, chosen_dx: list, final_level: str, drivers_list: list):
     acts = []
-    age_v   = float(row["age"])
-    los_v   = float(row["length_of_stay"])
-    adm_v   = float(row["num_previous_admissions"])
-    comp_v  = float(row["medication_compliance_score"])
-    sup_v   = float(row["family_support_score"])
-    fup_v   = float(row["post_discharge_followups"])
+    age_v   = _num_or_default(row["age"], "age")
+    los_v   = _num_or_default(row["length_of_stay"], "length_of_stay")
+    adm_v   = _num_or_default(row["num_previous_admissions"], "num_previous_admissions")
+    comp_v  = _num_or_default(row["medication_compliance_score"], "medication_compliance_score")
+    sup_v   = _num_or_default(row["family_support_score"], "family_support_score")
+    fup_v   = _num_or_default(row["post_discharge_followups"], "post_discharge_followups")
 
     has_selfharm = flag_yes(row, "has_recent_self_harm") or flag_yes(row, "self_harm_during_admission")
     has_sud = ("Substance Use Disorder" in chosen_dx)
@@ -559,7 +615,7 @@ def personalized_actions(row: pd.Series, chosen_dx: list, final_level: str, driv
     has_dep = ("Depression" in chosen_dx)
     has_scz = ("Schizophrenia" in chosen_dx)
 
-    # 1) 自傷相關
+    # 1) 自傷
     if has_selfharm:
         add(acts, "Today", "Clinician", "C-SSRS / suicide risk assessment; update safety plan; lethal-means counseling",
             "Self-harm flagged")
@@ -568,7 +624,7 @@ def personalized_actions(row: pd.Series, chosen_dx: list, final_level: str, driv
         add(acts, "48h", "Nurse", "Check-in call on safety plan adherence + symptom changes",
             "Post-discharge safety follow-up")
 
-    # 2) SUD × 低順從（交互）
+    # 2) SUD × 低順從
     if has_sud and comp_v <= 3:
         add(acts, "1–7d", "Clinician", "Brief motivational interviewing (MI) focused on use goals and treatment plan",
             "SUD with very low adherence")
@@ -577,7 +633,7 @@ def personalized_actions(row: pd.Series, chosen_dx: list, final_level: str, driv
         add(acts, "Today", "Clinician", "Overdose prevention education; provide local resources",
             "Risk reduction for SUD")
 
-    # 3) PD × 短住院（交互）
+    # 3) PD × 短住院
     if has_pd and los_v < 3:
         add(acts, "Today", "Care coordinator", "Same-day scheduling of DBT/skills group intake",
             "PD with very short stay")
@@ -624,7 +680,7 @@ def personalized_actions(row: pd.Series, chosen_dx: list, final_level: str, driv
         add(acts, "1–2w", "Nurse/Pharmacist", "Medication reconciliation; simplify dosing; assess cognitive/functional needs",
             "Older age")
 
-    # 10) 診斷導向（溫和）
+    # 10) 診斷導向
     if has_dep:
         add(acts, "1–2w", "Clinician", "Behavioral activation plan + specific activity schedule",
             "Depression—activation improves adherence")
@@ -802,6 +858,9 @@ if uploaded is not None:
         apply_onehot_prefix("Recent Self-harm","has_recent_self_harm", BIN_YESNO)
         apply_onehot_prefix("Self-harm During Admission","self_harm_during_admission", BIN_YESNO)
 
+        # ✅ Null-safe：批次補齊
+        fill_defaults_batch(df)
+
         Xb_aligned, _ = align_df_to_model(df, model)
         Xb_np = to_float32_np(Xb_aligned)
         base_probs = model.predict_proba(Xb_np, validate_features=False)[:, 1]
@@ -809,26 +868,31 @@ if uploaded is not None:
         # ---- Vectorized policy overlay for batch（含年齡、零追蹤加罰、交互效應）----
         lz = _logit_vec(base_probs)
 
+        # 數值陣列
+        adm_arr = pd.to_numeric(df["num_previous_admissions"], errors="coerce").fillna(DEFAULTS["num_previous_admissions"]).to_numpy()
+        comp_arr = pd.to_numeric(df["medication_compliance_score"], errors="coerce").fillna(DEFAULTS["medication_compliance_score"]).to_numpy()
+        sup_arr  = pd.to_numeric(df["family_support_score"], errors="coerce").fillna(DEFAULTS["family_support_score"]).to_numpy()
+        fup_arr  = pd.to_numeric(df["post_discharge_followups"], errors="coerce").fillna(DEFAULTS["post_discharge_followups"]).to_numpy()
+        los_arr  = pd.to_numeric(df["length_of_stay"], errors="coerce").fillna(DEFAULTS["length_of_stay"]).to_numpy()
+        age_arr  = pd.to_numeric(df["age"], errors="coerce").fillna(DEFAULTS["age"]).to_numpy()
+
         # 住院史
-        lz += POLICY["per_prev_admission"] * np.minimum(df["num_previous_admissions"].astype(float).to_numpy(), 5)
+        lz += POLICY["per_prev_admission"] * np.minimum(adm_arr, 5)
 
         # 順從、家支
-        lz += POLICY["per_point_low_compliance"] * np.maximum(0.0, 5.0 - df["medication_compliance_score"].astype(float).to_numpy())
-        lz += POLICY["per_point_low_support"] * np.maximum(0.0, 5.0 - df["family_support_score"].astype(float).to_numpy())
+        lz += POLICY["per_point_low_compliance"] * np.maximum(0.0, 5.0 - comp_arr)
+        lz += POLICY["per_point_low_support"] * np.maximum(0.0, 5.0 - sup_arr)
 
         # 追蹤 + 零追蹤加罰
-        fup = df["post_discharge_followups"].astype(float).to_numpy()
-        lz += POLICY["per_followup"] * fup
-        lz += POLICY["no_followup_extra"] * (fup == 0)
+        lz += POLICY["per_followup"] * fup_arr
+        lz += POLICY["no_followup_extra"] * (fup_arr == 0)
 
         # LOS
-        los_arr = df["length_of_stay"].astype(float).to_numpy()
         lz += np.where(los_arr < 3, POLICY["los_short"],
                 np.where(los_arr <= 14, POLICY["los_mid"],
                 np.where(los_arr <= 21, POLICY["los_mid_high"], POLICY["los_long"])))
 
         # 年齡極端
-        age_arr = df["age"].astype(float).to_numpy()
         lz += POLICY["age_young"] * (age_arr < 21)
         lz += POLICY["age_old"]   * (age_arr >= 75)
 
@@ -842,7 +906,7 @@ if uploaded is not None:
 
         # 交互效應
         sud = (df.get("diagnosis_Substance Use Disorder", 0).to_numpy() == 1)
-        very_low_comp = (df["medication_compliance_score"].astype(float).to_numpy() <= 3)
+        very_low_comp = (comp_arr <= 3)
         lz += POLICY["x_sud_lowcomp"] * (sud & very_low_comp)
 
         pd_mask = (df.get("diagnosis_Personality Disorder", 0).to_numpy() == 1)
@@ -883,22 +947,22 @@ if uploaded is not None:
             def push(name, val):
                 if val != 0: contribs.append((name, float(val)))
             # 住院史
-            push("More previous admissions", POLICY["per_prev_admission"] * min(float(df.iloc[i]["num_previous_admissions"]), 5))
+            push("More previous admissions", POLICY["per_prev_admission"] * min(float(adm_arr[i]), 5))
             # 順從/家支
-            push("Low medication compliance", POLICY["per_point_low_compliance"] * max(0.0, 5.0 - float(df.iloc[i]["medication_compliance_score"])))
-            push("Low family support", POLICY["per_point_low_support"] * max(0.0, 5.0 - float(df.iloc[i]["family_support_score"])))
+            push("Low medication compliance", POLICY["per_point_low_compliance"] * max(0.0, 5.0 - float(comp_arr[i])))
+            push("Low family support", POLICY["per_point_low_support"] * max(0.0, 5.0 - float(sup_arr[i])))
             # 追蹤
-            fu_i = float(df.iloc[i]["post_discharge_followups"])
+            fu_i = float(fup_arr[i])
             push("More post-discharge followups (protective)", POLICY["per_followup"] * fu_i)
             if fu_i == 0: push("No follow-up scheduled", POLICY["no_followup_extra"])
             # LOS
-            los_i = float(df.iloc[i]["length_of_stay"])
+            los_i = float(los_arr[i])
             if los_i < 3: push("Very short stay (<3d)", POLICY["los_short"])
             elif los_i <= 14: push("Typical stay (3–14d)", POLICY["los_mid"])
             elif los_i <= 21: push("Longish stay (15–21d)", POLICY["los_mid_high"])
             else: push("Very long stay (>21d)", POLICY["los_long"])
             # 年齡
-            age_i = float(df.iloc[i]["age"])
+            age_i = float(age_arr[i])
             if age_i < 21: push("Young age (<21)", POLICY["age_young"])
             elif age_i >= 75: push("Older age (≥75)", POLICY["age_old"])
             # 診斷
@@ -907,7 +971,7 @@ if uploaded is not None:
                     push(f"Diagnosis: {dx}", w)
             # 交互
             sud_i = (df.iloc[i].get("diagnosis_Substance Use Disorder", 0) == 1)
-            if sud_i and float(df.iloc[i]["medication_compliance_score"]) <= 3:
+            if sud_i and float(comp_arr[i]) <= 3:
                 push("SUD × very low compliance", POLICY["x_sud_lowcomp"])
             pd_i = (df.iloc[i].get("diagnosis_Personality Disorder", 0) == 1)
             if pd_i and los_i < 3:
