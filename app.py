@@ -36,23 +36,23 @@ TEMPLATE_COLUMNS = [
     "self_harm_during_admission_Yes","self_harm_during_admission_No",
 ]
 
-# ====== Load or train ======
+# ====== Load or train (with auto-fallback to demo if features don't match) ======
 def try_load_model(path="dropout_model.pkl"):
     if not os.path.exists(path):
         return None
-    bundle = joblib.load(path)
-    if isinstance(bundle, dict) and "model" in bundle:
-        return bundle["model"]
-    return bundle
+    try:
+        bundle = joblib.load(path)
+        if isinstance(bundle, dict) and "model" in bundle:
+            return bundle["model"]
+        return bundle
+    except Exception:
+        return None
 
-model = try_load_model()
-if model is None:
+def train_demo_model(TEMPLATE_COLUMNS):
     import xgboost as xgb
-    st.warning("⚠️ No model found. Training a demo model from literature-weighted synthetic data.")
     rng = np.random.default_rng(42)
     n = 8000
     X = pd.DataFrame(0, index=range(n), columns=TEMPLATE_COLUMNS, dtype=np.float32)
-
     # marginals
     X["age"] = rng.integers(16, 85, n)
     X["length_of_stay"] = rng.normal(5.0, 3.0, n).clip(0, 45)
@@ -61,11 +61,11 @@ if model is None:
     X["family_support_score"] = rng.normal(5.0, 2.5, n).clip(0, 10)
     X["post_discharge_followups"] = rng.integers(0, 6, n)
 
+    # one-hot pickers
     def pick_one(prefix, options):
         idx = rng.integers(0, len(options), n)
         for i, opt in enumerate(options):
             X.loc[idx == i, f"{prefix}_{opt}"] = 1
-
     pick_one("gender", GENDER_LIST)
     pick_one("diagnosis", DIAG_LIST)
     pick_one("has_social_worker", BIN_YESNO)
@@ -89,7 +89,6 @@ if model is None:
         "Substance Use Disorder": 0.35,"Dementia": 0.15,"Anxiety": 0.15,"PTSD": 0.20,
         "OCD": 0.10,"ADHD": 0.10,"Other/Unknown": 0.10,
     }
-
     prev_ge2 = (X["num_previous_admissions"] >= 2).astype(np.float32)
     logit = (
         beta0
@@ -104,12 +103,9 @@ if model is None:
     )
     for d, w in beta_diag.items():
         logit = logit + w * X[f"diagnosis_{d}"]
-
     noise = rng.normal(0.0, 0.35, n).astype(np.float32)
-    logit = logit + noise
-    p = 1.0 / (1.0 + np.exp(-logit))
+    p = 1.0 / (1.0 + np.exp(-(logit + noise)))
     y = (rng.random(n) < p).astype(np.int32)
-    st.caption(f"Simulated prevalence ≈ {p.mean():.2f}")
 
     model = xgb.XGBClassifier(
         n_estimators=400, max_depth=4, learning_rate=0.06,
@@ -117,8 +113,38 @@ if model is None:
         random_state=42, tree_method="hist",
         objective="binary:logistic", eval_metric="logloss",
     )
-    # ⭐ 變更1：用 DataFrame（含欄名）訓練，保留 feature_names
+    # 用 DataFrame（含欄名）訓練，保留 feature_names
     model.fit(X, y)
+    return model
+
+# 先嘗試載入；若特徵不匹配或可解釋度明顯有問題，改用 demo
+model = try_load_model()
+
+def get_feat_names(m):
+    try:
+        b = m.get_booster()
+        if getattr(b, "feature_names", None):
+            return list(b.feature_names)
+    except Exception:
+        pass
+    if hasattr(m, "feature_names_in_"):
+        return list(m.feature_names_in_)
+    return None
+
+loaded = model is not None
+use_demo = False
+if model is not None:
+    names = get_feat_names(model)
+    # 1) 沒有特徵名、或特徵數差很多 → 視為不相容
+    if (names is None) or (abs(len(names) - len(TEMPLATE_COLUMNS)) > 5):
+        use_demo = True
+
+if (not loaded) or use_demo:
+    model = train_demo_model(TEMPLATE_COLUMNS)
+    model_source = "demo (literature-weighted)"
+else:
+    model_source = "loaded from dropout_model.pkl"
+
 
 # ====== alignment helpers ======
 def get_model_feature_order(m):
@@ -220,6 +246,21 @@ if flag_yes(X_final.iloc[0], "has_recent_self_harm"):
     percent, score, level = 70.0, 70, "High"; override_reason = "recent self-harm"
 elif flag_yes(X_final.iloc[0], "self_harm_during_admission"):
     percent, score, level = 70.0, 70, "High"; override_reason = "in-hospital self-harm"
+# ====== Model diagnostics (quick sanity check) ======
+with st.expander("Model diagnostics", expanded=False):
+    st.write(f"**Model source:** {model_source}")
+    try:
+        booster = model.get_booster()
+        fmap = booster.get_fscore()  # split counts
+        # 轉為 DataFrame 並依重要性排序
+        imp = (pd.Series(fmap, name="split_count")
+               .reindex(get_feat_names(model) or [], fill_value=0)
+               .sort_values(ascending=False).head(10))
+        st.caption("Top-10 features by split count (proxy for importance):")
+        st.dataframe(imp.reset_index(names="feature"))
+    except Exception as e:
+        st.caption(f"Importance not available: {e}")
+
 
 # ====== Show result ======
 st.subheader("Predicted Dropout Risk (within 3 months)")
