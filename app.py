@@ -236,23 +236,41 @@ elif level == "Moderate":
 else:
     st.success("🟢 Low Risk")
 
-# ====== SHAP ======
+# ====== SHAP (version-agnostic via XGBoost pred_contribs) ======
 with st.expander("SHAP Explanation", expanded=True):
     st.caption("How to read: positive bars push toward higher dropout risk; negative bars lower it. Only the selected category for each one-hot feature is shown.")
-    # ⭐ 變更2：用『有欄名的 DataFrame』做 SHAP（避免只有一個特徵）
-    explainer = shap.TreeExplainer(model)
-    sv_raw = explainer.shap_values(X_aligned_df)   # <= 傳入 DataFrame，不要 numpy
-    base_value = explainer.expected_value
-    if isinstance(base_value, (list, np.ndarray)) and not np.isscalar(base_value):
-        base_value = base_value[0]
-        if isinstance(sv_raw, list): sv_raw = sv_raw[0]
-    sv_raw = sv_raw[0]  # (n_features,)
+    import xgboost as xgb
+    import numpy as np
+    import shap
+    import matplotlib.pyplot as plt
 
-    # 對應回欄名
-    used_names = list(X_aligned_df.columns)
-    sv_map = dict(zip(used_names, sv_raw))
+    try:
+        # 用 Booster + DMatrix 直接取 SHAP 貢獻；最後一欄是 bias（base value）
+        booster = model.get_booster()
+        dmat = xgb.DMatrix(X_aligned_df, feature_names=list(X_aligned_df.columns))
+        contribs = booster.predict(dmat, pred_contribs=True, validate_features=False)
+        contrib = np.asarray(contribs)[0]              # (n_features + 1,)
+        base_value = float(contrib[-1])                # bias term
+        feat_contrib = contrib[:-1]                    # 對應每個特徵
+        used_names = list(X_aligned_df.columns)
+        sv_map = dict(zip(used_names, feat_contrib))
+    except Exception:
+        # 萬一雲端 xgboost 不支援 pred_contribs，再退回 TreeExplainer（保險）
+        explainer = shap.TreeExplainer(model)
+        sv_raw = explainer.shap_values(X_aligned_df)
+        base_value = explainer.expected_value
+        if isinstance(base_value, (list, np.ndarray)) and not np.isscalar(base_value):
+            base_value = base_value[0]
+            if isinstance(sv_raw, list):
+                sv_raw = sv_raw[0]
+        sv_raw = sv_raw[0]
+        used_names = list(X_aligned_df.columns)
+        sv_map = dict(zip(used_names, sv_raw))
 
-    # 連續特徵
+    # 把底層特徵貢獻，聚合成「和左側語意一致」的顯示
+    names, vals, data_vals = [], [], []
+
+    # 連續特徵（直接顯示）
     cont_feats = [
         ("Age","age", X_final.at[0,"age"]),
         ("Length of Stay (days)","length_of_stay", X_final.at[0,"length_of_stay"]),
@@ -261,32 +279,35 @@ with st.expander("SHAP Explanation", expanded=True):
         ("Family Support (0–10)","family_support_score", X_final.at[0,"family_support_score"]),
         ("Post-discharge Followups","post_discharge_followups", X_final.at[0,"post_discharge_followups"]),
     ]
-    names, vals, data_vals = [], [], []
     for label, key, dv in cont_feats:
         if key in sv_map:
-            names.append(label); vals.append(sv_map[key]); data_vals.append(dv)
+            names.append(label); vals.append(float(sv_map[key])); data_vals.append(dv)
 
-    # 類別（只顯示被選中的）
+    # 類別特徵：只顯示被選中的 one-hot
     def add_onehot(title, prefix, value):
         col = f"{prefix}_{value}"
         if col in sv_map:
-            names.append(f"{title}={value}"); vals.append(sv_map[col]); data_vals.append(1)
+            names.append(f"{title}={value}")
+            vals.append(float(sv_map[col]))
+            data_vals.append(1)
+
     add_onehot("Gender","gender", gender)
     add_onehot("Diagnosis","diagnosis", diagnosis)
     add_onehot("Has Social Worker","has_social_worker", social_worker)
     add_onehot("Recent Self-harm","has_recent_self_harm", recent_self_harm)
     add_onehot("Self-harm During Admission","self_harm_during_admission", selfharm_adm)
 
-    # 顯示前 12 名
+    # 依絕對值排序顯示前 12 名
     order = np.argsort(np.abs(np.array(vals)))[::-1][:12]
     exp = shap.Explanation(
-        values=np.array(vals)[order],
+        values=np.array(vals, dtype=float)[order],
         base_values=base_value,
         feature_names=[names[i] for i in order],
-        data=np.array(data_vals)[order],
+        data=np.array(data_vals, dtype=float)[order],
     )
     shap.plots.waterfall(exp, show=False, max_display=12)
     st.pyplot(plt.gcf(), clear_figure=True)
+
 
 # ====== Recommended Actions ======
 st.subheader("Recommended Actions")
