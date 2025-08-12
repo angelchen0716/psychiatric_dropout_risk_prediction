@@ -158,6 +158,7 @@ with c1: st.metric("Probability", f"{percent:.1f}%")
 with c2: st.metric("Risk Score (0–100)", f"{score}")
 if override_reason:
     st.error(f"🔴 High Risk (safety override: {override_reason})")
+    st.caption("ℹ️ This risk level is determined by a **clinical safety override** rule, not purely by the model's probability output.")
 elif level == "High":
     st.error("🔴 High Risk")
 elif level == "Moderate":
