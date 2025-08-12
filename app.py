@@ -1,4 +1,4 @@
-# app.py — Psychiatric Dropout Risk (full version)
+# app.py — Psychiatric Dropout Risk with Safety Override
 import os
 import streamlit as st
 import pandas as pd
@@ -8,7 +8,6 @@ import shap
 import matplotlib.pyplot as plt
 from io import BytesIO
 
-# Optional Word export
 try:
     from docx import Document
     HAS_DOCX = True
@@ -64,7 +63,7 @@ TEMPLATE_COLUMNS = resolve_template_columns(model, pretrained_cols)
 
 if model is None:
     import xgboost as xgb
-    st.warning("⚠️ dropout_model.pkl not found — building synthetic demo model.")
+    st.warning("⚠️ dropout_model.pkl not found — building a synthetic demo model.")
     rng = np.random.default_rng(42)
     n = 2000
     X = pd.DataFrame(0, index=range(n), columns=TEMPLATE_COLUMNS, dtype=float)
@@ -87,7 +86,7 @@ if model is None:
             - 0.3*X["medication_compliance_score"] + 0.4*(X["num_previous_admissions"]>=1)
     p = 1/(1+np.exp(-logit))
     y = (rng.random(n) < p).astype(int)
-    model = xgb.XGBClassifier(
+    model = xgboost.XGBClassifier(
         n_estimators=300, max_depth=4, subsample=0.9, colsample_bytree=0.8,
         learning_rate=0.06, eval_metric="logloss", random_state=42
     )
@@ -110,7 +109,7 @@ def recalibrate_probability(row: pd.Series, base_prob: float) -> float:
     if int(row.get('self_harm_during_admission_Yes', 0)) == 1: z += 1.0
     return float(_sigmoid(z))
 
-# ====== Sidebar: patient info ======
+# ====== Sidebar ======
 with st.sidebar:
     st.header("Patient Info")
     age = st.slider("Age", 18, 90, 35)
@@ -146,20 +145,32 @@ for col in [
 ]:
     if col in X_final.columns: X_final.at[0, col] = 1
 
-# ====== Predict & classify ======
+# ====== Predict & Safety Override ======
 base_prob = model.predict_proba(X_final, validate_features=False)[0][1]
 adj_prob  = recalibrate_probability(X_final.iloc[0], base_prob)
 percent, score = proba_to_percent(adj_prob), proba_to_score(adj_prob)
 level = classify(score)
 
+override_reason = None
+if int(X_final.iloc[0].get('has_recent_self_harm_Yes', 0)) == 1:
+    percent, score, level = 70.0, 70, "High"
+    override_reason = "recent self-harm"
+elif int(X_final.iloc[0].get('self_harm_during_admission_Yes', 0)) == 1:
+    percent, score, level = 70.0, 70, "High"
+    override_reason = "in-hospital self-harm"
+
 st.subheader("Predicted Dropout Risk (within 3 months)")
 c1, c2 = st.columns(2)
 with c1: st.metric("Probability", f"{percent:.1f}%")
 with c2: st.metric("Risk Score (0–100)", f"{score}")
-if level == "High":      st.error("🔴 High Risk")
-elif level == "Moderate":st.warning("🟡 Moderate Risk")
-else:                    st.success("🟢 Low Risk")
-st.markdown("---")
+if override_reason:
+    st.error(f"🔴 High Risk (safety override: {override_reason})")
+elif level == "High":
+    st.error("🔴 High Risk")
+elif level == "Moderate":
+    st.warning("🟡 Moderate Risk")
+else:
+    st.success("🟢 Low Risk")
 
 # ====== SHAP waterfall ======
 with st.expander("SHAP Explanation", expanded=True):
@@ -183,8 +194,8 @@ with st.expander("SHAP Explanation", expanded=True):
 st.subheader("Recommended Actions")
 BASE_ACTIONS = {
     "High": [
-        ("Today","Clinic scheduler","Book return within 7 days (before discharge)."),
-        ("Today","Social worker","Enroll in CM/peer support; create plan."),
+        ("Today","Clinic scheduler","Book return within 7 days."),
+        ("Today","Social worker","Enroll in CM."),
         ("Today","Clinician","Safety plan + crisis hotline."),
     ],
     "Moderate": [("1–2 weeks","Clinic scheduler","Schedule return.")],
@@ -203,7 +214,7 @@ for r in rows:
 for tl, ow, ac in uniq:
     st.markdown(f"**{tl}** | {ow} | {ac}")
 
-# ====== SOP export if High ======
+# ====== SOP export ======
 if level == "High":
     def make_sop_txt(score: int, label: str, actions: list) -> BytesIO:
         lines = ["Psychiatric Dropout Risk – SOP", f"Risk score: {score}/100 | Risk level: {label}", ""]
@@ -257,7 +268,13 @@ if uploaded is not None:
                     if onehot in df.columns: df.at[i, onehot] = 1
         Xb = df[TEMPLATE_COLUMNS]
         base_probs = model.predict_proba(Xb, validate_features=False)[:, 1]
-        adj_probs = [recalibrate_probability(Xb.iloc[i], base_probs[i]) for i in range(len(Xb))]
+        adj_probs = []
+        for i in range(len(Xb)):
+            bp = recalibrate_probability(Xb.iloc[i], base_probs[i])
+            # Safety override for batch
+            if int(Xb.iloc[i].get('has_recent_self_harm_Yes', 0)) == 1 or int(Xb.iloc[i].get('self_harm_during_admission_Yes', 0)) == 1:
+                bp = 0.70
+            adj_probs.append(bp)
         out = raw.copy()
         out["risk_percent"] = (np.array(adj_probs)*100).round(1)
         out["risk_score_0_100"] = (np.array(adj_probs)*100).round().astype(int)
