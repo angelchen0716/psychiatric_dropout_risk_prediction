@@ -8,3 +8,4 @@ matplotlib
 joblib
 openpyxl
 python-docx
+scikit-learn>=1.0
