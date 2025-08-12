@@ -993,3 +993,373 @@ if uploaded is not None:
         st.download_button("⬇️ Download Results (CSV)", buf_out, "predictions.csv", "text/csv")
     except Exception as e:
         st.error(f"Error: {e}")
+# =========================
+# === Validation (synthetic hold-out) + Vignettes template
+# =========================
+st.markdown("---")
+st.header("✅ Validation (synthetic hold-out)")
+
+# ---- helpers: overlay (vectorized,與你批次區一致) ----
+def overlay_blend_vectorized(df_feat: pd.DataFrame, base_probs: np.ndarray):
+    lz = _logit_vec(base_probs)
+
+    # 數值陣列（空值安全）
+    adm = pd.to_numeric(df_feat["num_previous_admissions"], errors="coerce").fillna(DEFAULTS["num_previous_admissions"]).to_numpy()
+    comp = pd.to_numeric(df_feat["medication_compliance_score"], errors="coerce").fillna(DEFAULTS["medication_compliance_score"]).to_numpy()
+    sup  = pd.to_numeric(df_feat["family_support_score"], errors="coerce").fillna(DEFAULTS["family_support_score"]).to_numpy()
+    fup  = pd.to_numeric(df_feat["post_discharge_followups"], errors="coerce").fillna(DEFAULTS["post_discharge_followups"]).to_numpy()
+    los  = pd.to_numeric(df_feat["length_of_stay"], errors="coerce").fillna(DEFAULTS["length_of_stay"]).to_numpy()
+    agev = pd.to_numeric(df_feat["age"], errors="coerce").fillna(DEFAULTS["age"]).to_numpy()
+
+    # 住院史
+    lz += POLICY["per_prev_admission"] * np.minimum(adm, 5)
+
+    # 順從、家庭支持（以 5 為中心）
+    lz += POLICY["per_point_low_compliance"] * np.maximum(0.0, 5.0 - comp)
+    lz += POLICY["per_point_low_support"] * np.maximum(0.0, 5.0 - sup)
+
+    # 追蹤 + 零追蹤加罰
+    lz += POLICY["per_followup"] * fup
+    if "no_followup_extra" in POLICY:
+        lz += POLICY["no_followup_extra"] * (fup == 0)
+
+    # 住院日數
+    lz += np.where(los < 3, POLICY["los_short"],
+            np.where(los <= 14, POLICY["los_mid"],
+            np.where(los <= 21, POLICY["los_mid_high"], POLICY["los_long"])))
+
+    # 年齡極端
+    if "age_young" in POLICY: lz += POLICY["age_young"] * (agev < 21)
+    if "age_old"   in POLICY: lz += POLICY["age_old"]   * (agev >= 75)
+
+    # 診斷（可複選相加）
+    diag_term = np.zeros(len(df_feat), dtype=float)
+    for dx, w in POLICY["diag"].items():
+        col = f"diagnosis_{dx}"
+        if col in df_feat.columns:
+            diag_term += w * (df_feat[col].to_numpy() == 1)
+    lz += diag_term
+
+    # 交互效應（若你前面有設定）
+    if "x_sud_lowcomp" in POLICY:
+        sud = (df_feat.get("diagnosis_Substance Use Disorder", 0).to_numpy() == 1)
+        very_low_comp = (comp <= 3)
+        lz += POLICY["x_sud_lowcomp"] * (sud & very_low_comp)
+    if "x_pd_shortlos" in POLICY:
+        pd_mask = (df_feat.get("diagnosis_Personality Disorder", 0).to_numpy() == 1)
+        lz += POLICY["x_pd_shortlos"] * (pd_mask & (los < 3))
+
+    # 校正 + overlay 機率
+    lz += CAL_LOGIT_SHIFT
+    p_overlay = 1.0 / (1.0 + np.exp(-lz))
+
+    # 平滑混合：Final = (1-BLEND)*Model + BLEND*Overlay
+    p_policy = (1.0 - BLEND_W) * base_probs + BLEND_W * p_overlay
+
+    # self-harm uplift（與主流程一致）
+    hrsh = df_feat.get("has_recent_self_harm_Yes", 0)
+    shadm = df_feat.get("self_harm_during_admission_Yes", 0)
+    soft_mask = ((np.array(hrsh) == 1) | (np.array(shadm) == 1))
+    p_final = p_policy.copy()
+    p_final[soft_mask] = np.minimum(np.maximum(p_final[soft_mask], SOFT_UPLIFT["floor"]) + SOFT_UPLIFT["add"], SOFT_UPLIFT["cap"])
+    return p_final
+
+# ---- synthetic data generator（與 demo 訓練分佈一致）----
+def generate_synth_holdout(n=20000, seed=2024):
+    rng = np.random.default_rng(seed)
+    df = pd.DataFrame(0, index=range(n), columns=TEMPLATE_COLUMNS, dtype=float)
+
+    # 數值邊際分佈（與 demo 一致/近似）
+    df["age"] = rng.integers(16, 85, n)
+    df["length_of_stay"] = rng.normal(5.0, 3.0, n).clip(0, 45)
+    df["num_previous_admissions"] = rng.poisson(0.8, n).clip(0, 12)
+    df["medication_compliance_score"] = rng.normal(6.0, 2.5, n).clip(0, 10)
+    df["family_support_score"] = rng.normal(5.0, 2.5, n).clip(0, 10)
+    df["post_discharge_followups"] = rng.integers(0, 6, n)
+
+    # 性別
+    idx_gender = rng.integers(0, len(GENDER_LIST), n)
+    for i, g in enumerate(GENDER_LIST):
+        col = f"gender_{g}"
+        if col in df.columns:
+            df.loc[idx_gender == i, col] = 1
+
+    # 多診斷：主診斷 + 常見共病
+    idx_primary = rng.integers(0, len(DIAG_LIST), n)
+    for i, d in enumerate(DIAG_LIST):
+        df.loc[idx_primary == i, f"diagnosis_{d}"] = 1
+    extra_probs = {"Substance Use Disorder": 0.20, "Anxiety": 0.20, "Depression": 0.25, "PTSD": 0.10}
+    for d, pr in extra_probs.items():
+        mask = (rng.random(n) < pr)
+        df.loc[mask, f"diagnosis_{d}"] = 1
+    # 至少一個診斷
+    diag_cols = [f"diagnosis_{d}" for d in DIAG_LIST]
+    none_diag_mask = (df[diag_cols].sum(axis=1) == 0)
+    if none_diag_mask.any():
+        rp = rng.integers(0, len(DIAG_LIST), none_diag_mask.sum())
+        df.loc[none_diag_mask, [f"diagnosis_{DIAG_LIST[i]}" for i in rp]] = 1
+
+    # 自傷旗標
+    idx_rsh = rng.integers(0, 2, n)
+    idx_shadm = rng.integers(0, 2, n)
+    df.loc[idx_rsh == 1, "has_recent_self_harm_Yes"] = 1
+    df.loc[idx_rsh == 0, "has_recent_self_harm_No"] = 1
+    df.loc[idx_shadm == 1, "self_harm_during_admission_Yes"] = 1
+    df.loc[idx_shadm == 0, "self_harm_during_admission_No"] = 1
+
+    # --- 生成真值標籤（與 demo 訓練邏輯一致）---
+    beta0 = -0.60
+    beta = {
+        "has_recent_self_harm_Yes": 0.80,
+        "self_harm_during_admission_Yes": 0.60,
+        "prev_adm_ge2": 0.60,
+        "medication_compliance_per_point": -0.25,
+        "family_support_per_point": -0.20,
+        "followups_per_visit": -0.12,
+        "length_of_stay_per_day": 0.05,
+    }
+    beta_diag = {
+        "Personality Disorder":    0.35,
+        "Substance Use Disorder":  0.35,
+        "Bipolar":                 0.10,
+        "PTSD":                    0.10,
+        "Schizophrenia":           0.10,
+        "Depression":              0.05,
+        "Anxiety":                 0.00,
+        "OCD":                     0.00,
+        "Dementia":                0.00,
+        "ADHD":                    0.00,
+        "Other/Unknown":           0.00,
+    }
+    prev_ge2 = (df["num_previous_admissions"] >= 2).astype(np.float32)
+    logit = (
+        beta0
+        + beta["has_recent_self_harm_Yes"]        * df["has_recent_self_harm_Yes"]
+        + beta["self_harm_during_admission_Yes"]  * df["self_harm_during_admission_Yes"]
+        + beta["prev_adm_ge2"]                    * prev_ge2
+        + beta["medication_compliance_per_point"] * df["medication_compliance_score"]
+        + beta["family_support_per_point"]        * df["family_support_score"]
+        + beta["followups_per_visit"]             * df["post_discharge_followups"]
+        + beta["length_of_stay_per_day"]          * df["length_of_stay"]
+    )
+    for d, w in beta_diag.items():
+        logit = logit + w * df[f"diagnosis_{d}"]
+    noise = rng.normal(0.0, 0.35, n).astype(np.float32)
+    p_true = 1.0 / (1.0 + np.exp(-(logit + noise)))
+    y_true = (rng.random(n) < p_true).astype(int)
+
+    # 空值安全（萬一）
+    fill_defaults_batch(df)
+    return df, y_true, p_true
+
+# ---- metrics & plots ----
+def _calibration_bins(y_true, prob, n_bins=10):
+    y_true = np.asarray(y_true).astype(int)
+    prob = np.asarray(prob).astype(float)
+    bins = np.linspace(0.0, 1.0, n_bins+1)
+    idx = np.digitize(prob, bins) - 1
+    frac_pos, mean_pred, weights = [], [], []
+    for b in range(n_bins):
+        m = (idx == b)
+        if m.sum() == 0:
+            frac_pos.append(np.nan); mean_pred.append(np.nan); weights.append(0.0)
+        else:
+            frac_pos.append(y_true[m].mean())
+            mean_pred.append(prob[m].mean())
+            weights.append(m.mean())
+    return np.array(mean_pred), np.array(frac_pos), np.array(weights)
+
+def _ece(y_true, prob, n_bins=10):
+    mp, fp, w = _calibration_bins(y_true, prob, n_bins)
+    mask = ~np.isnan(mp) & ~np.isnan(fp)
+    if mask.sum() == 0: return np.nan
+    return float(np.sum(w[mask] * np.abs(fp[mask] - mp[mask])))
+
+def _plot_roc_pr(y_true, p1, p2, label1="Model", label2="Final"):
+    import matplotlib.pyplot as plt
+    from sklearn.metrics import roc_curve, auc, precision_recall_curve, average_precision_score
+
+    # ROC
+    fpr1, tpr1, _ = roc_curve(y_true, p1); roc1 = auc(fpr1, tpr1)
+    fpr2, tpr2, _ = roc_curve(y_true, p2); roc2 = auc(fpr2, tpr2)
+    fig1, ax1 = plt.subplots()
+    ax1.plot(fpr1, tpr1, label=f"{label1} AUC={roc1:.3f}")
+    ax1.plot(fpr2, tpr2, label=f"{label2} AUC={roc2:.3f}")
+    ax1.plot([0,1],[0,1], linestyle="--")
+    ax1.set_xlabel("False Positive Rate"); ax1.set_ylabel("True Positive Rate"); ax1.set_title("ROC")
+    ax1.legend(loc="lower right")
+    st.pyplot(fig1, clear_figure=True)
+
+    # PR
+    p1_prec, p1_rec, _ = precision_recall_curve(y_true, p1)
+    ap1 = average_precision_score(y_true, p1)
+    p2_prec, p2_rec, _ = precision_recall_curve(y_true, p2)
+    ap2 = average_precision_score(y_true, p2)
+    fig2, ax2 = plt.subplots()
+    ax2.plot(p1_rec, p1_prec, label=f"{label1} AP={ap1:.3f}")
+    ax2.plot(p2_rec, p2_prec, label=f"{label2} AP={ap2:.3f}")
+    ax2.set_xlabel("Recall"); ax2.set_ylabel("Precision"); ax2.set_title("Precision–Recall")
+    ax2.legend(loc="upper right")
+    st.pyplot(fig2, clear_figure=True)
+
+def _plot_calibration(y_true, p1, p2, n_bins=10, label1="Model", label2="Final"):
+    mp1, fp1, _ = _calibration_bins(y_true, p1, n_bins)
+    mp2, fp2, _ = _calibration_bins(y_true, p2, n_bins)
+    fig, ax = plt.subplots()
+    ax.plot([0,1],[0,1], linestyle="--", label="Perfect")
+    ax.plot(mp1, fp1, marker="o", label=label1)
+    ax.plot(mp2, fp2, marker="o", label=label2)
+    ax.set_xlabel("Mean predicted probability (bin)")
+    ax.set_ylabel("Fraction of positives (bin)")
+    ax.set_title("Calibration (Reliability) Diagram")
+    ax.legend(loc="upper left")
+    st.pyplot(fig, clear_figure=True)
+
+def _binary_confusion(y_true, prob, thr):
+    from sklearn.metrics import confusion_matrix
+    y_pred = (prob >= thr).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    return tn, fp, fn, tp
+
+# ---- UI ----
+cA, cB = st.columns([2,1])
+with cA:
+    n_val = st.slider("Number of synthetic patients", 5000, 50000, 20000, 5000)
+    seed_val = st.number_input("Random seed", min_value=1, max_value=10**9, value=2024, step=1)
+with cB:
+    run_val = st.button("Run validation")
+
+if run_val:
+    try:
+        from sklearn.metrics import roc_auc_score, average_precision_score, brier_score_loss
+    except Exception as e:
+        st.error(f"scikit-learn not available: {e}. Please `pip install scikit-learn`.")
+    else:
+        with st.spinner("Generating synthetic hold-out and evaluating..."):
+            df_syn, y_true, p_true = generate_synth_holdout(n=n_val, seed=seed_val)
+            # 模型預測
+            Xb_aligned, _ = align_df_to_model(df_syn, model)
+            p_model = model.predict_proba(to_float32_np(Xb_aligned), validate_features=False)[:, 1]
+            # Final（overlay + blend + uplift）
+            p_final = overlay_blend_vectorized(df_syn, p_model)
+
+            # 指標
+            auc_m = roc_auc_score(y_true, p_model)
+            auc_f = roc_auc_score(y_true, p_final)
+            ap_m = average_precision_score(y_true, p_model)
+            ap_f = average_precision_score(y_true, p_final)
+            brier_m = brier_score_loss(y_true, p_model)
+            brier_f = brier_score_loss(y_true, p_final)
+            ece_m = _ece(y_true, p_model, 10)
+            ece_f = _ece(y_true, p_final, 10)
+
+            st.subheader("Metrics")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("AUC (Model)", f"{auc_m:.3f}")
+                st.metric("AUC (Final)", f"{auc_f:.3f}")
+            with c2:
+                st.metric("PR-AUC (Model)", f"{ap_m:.3f}")
+                st.metric("PR-AUC (Final)", f"{ap_f:.3f}")
+            with c3:
+                st.metric("Brier (Model)", f"{brier_m:.3f}")
+                st.metric("Brier (Final)", f"{brier_f:.3f}")
+                st.caption(f"ECE (Model/Final, 10 bins): {ece_m:.3f} / {ece_f:.3f}")
+
+            st.subheader("Curves")
+            _plot_roc_pr(y_true, p_model, p_final, "Model", "Final")
+            _plot_calibration(y_true, p_model, p_final, n_bins=10, label1="Model", label2="Final")
+
+            st.subheader("Operational confusion (binary)")
+            thr_mod = MOD_CUT / 100.0        # 「Moderate 或以上」做為行動門檻
+            thr_high = HIGH_CUT / 100.0      # 「High」門檻
+            tn1, fp1, fn1, tp1 = _binary_confusion(y_true, p_model, thr_mod)
+            tn2, fp2, fn2, tp2 = _binary_confusion(y_true, p_final, thr_mod)
+            tn3, fp3, fn3, tp3 = _binary_confusion(y_true, p_model, thr_high)
+            tn4, fp4, fn4, tp4 = _binary_confusion(y_true, p_final, thr_high)
+
+            ccm1, ccm2 = st.columns(2)
+            with ccm1:
+                st.markdown(f"**Threshold: Moderate (≥{MOD_CUT}%)**")
+                st.write(f"Model — TN:{tn1} FP:{fp1} FN:{fn1} TP:{tp1}")
+                st.write(f"Final — TN:{tn2} FP:{fp2} FN:{fn2} TP:{tp2}")
+            with ccm2:
+                st.markdown(f"**Threshold: High (≥{HIGH_CUT}%)**")
+                st.write(f"Model — TN:{tn3} FP:{fp3} FN:{fn3} TP:{tp3}")
+                st.write(f"Final — TN:{tn4} FP:{fp4} FN:{fn4} TP:{tp4}")
+
+        st.success("Validation finished.")
+
+# =========================
+# === Vignettes (for expert review) template
+# =========================
+st.markdown("---")
+st.header("🧾 Vignettes template (for expert review)")
+
+def _mk_vignette_row(age, gender, diags, los, prev, comp, rsh, shadm, sup, fup):
+    return {
+        "Age": age,
+        "Gender": gender,
+        "Diagnoses": ", ".join(diags),
+        "Length of Stay (days)": los,
+        "Previous Admissions (1y)": prev,
+        "Medication Compliance Score (0–10)": comp,
+        "Recent Self-harm": rsh,
+        "Self-harm During Admission": shadm,
+        "Family Support Score (0–10)": sup,
+        "Post-discharge Followups": fup,
+        "Expert Risk (Low/Moderate/High or 0–100)": ""
+    }
+
+def build_vignettes_df(n=20, seed=77):
+    rng = np.random.default_rng(seed)
+    base = []
+    protos = [
+        (19, "Female", ["Depression"], 2, 0, 3, "No", "No", 2, 0),
+        (28, "Male", ["Substance Use Disorder"], 1, 3, 2, "No", "No", 3, 0),
+        (35, "Male", ["Bipolar"], 6, 1, 4, "No", "No", 5, 1),
+        (42, "Female", ["Personality Disorder"], 2, 2, 3, "No", "No", 4, 0),
+        (55, "Male", ["Schizophrenia"], 10, 4, 5, "No", "No", 5, 2),
+        (63, "Female", ["PTSD"], 4, 1, 6, "No", "No", 6, 1),
+        (72, "Male", ["Depression","Anxiety"], 5, 0, 7, "No", "No", 7, 2),
+        (23, "Female", ["OCD"], 3, 0, 8, "No", "No", 8, 2),
+        (31, "Male", ["Substance Use Disorder","Depression"], 7, 2, 3, "No", "No", 3, 0),
+        (47, "Female", ["Personality Disorder","PTSD"], 2, 1, 4, "No", "No", 4, 0),
+        (38, "Male", ["ADHD"], 4, 0, 6, "No", "No", 6, 1),
+        (26, "Female", ["Anxiety"], 1, 0, 5, "No", "No", 5, 1),
+        (60, "Male", ["Dementia"], 12, 1, 6, "No", "No", 6, 2),
+        (45, "Female", ["Schizophrenia","Substance Use Disorder"], 9, 3, 2, "No", "No", 3, 0),
+        (52, "Male", ["Bipolar","Personality Disorder"], 2, 2, 3, "No", "No", 4, 0),
+        (33, "Female", ["Depression"], 3, 0, 8, "No", "No", 8, 3),
+        (29, "Male", ["Substance Use Disorder"], 5, 2, 2, "No", "No", 4, 0),
+        (70, "Female", ["Depression","PTSD"], 8, 1, 5, "No", "No", 6, 2),
+        (41, "Male", ["Personality Disorder","Substance Use Disorder"], 2, 3, 3, "No", "No", 3, 0),
+        (36, "Female", ["Other/Unknown"], 4, 0, 5, "No", "No", 5, 1),
+    ]
+    # 產生 n 筆（前 20 筆固定樣本，若 n>20 其餘隨機微擾）
+    for i in range(min(n, len(protos))):
+        base.append(_mk_vignette_row(*protos[i]))
+    for i in range(len(base), n):
+        # 隨機微擾生成
+        age = int(np.clip(rng.normal(40, 15), 18, 90))
+        gender = GENDER_LIST[int(rng.integers(0, len(GENDER_LIST)))]
+        # 1–2 個診斷
+        k = int(rng.integers(1, 3))
+        diags = list(rng.choice(DIAG_LIST, size=k, replace=False))
+        los = int(np.clip(rng.normal(5, 3), 0, 45))
+        prev = int(np.clip(rng.poisson(1.0), 0, 8))
+        comp = float(np.clip(rng.normal(6, 2.5), 0, 10))
+        rsh = rng.choice(["Yes","No"])
+        shadm = rng.choice(["Yes","No"])
+        sup = float(np.clip(rng.normal(5, 2.5), 0, 10))
+        fup = int(np.clip(rng.integers(0, 4), 0, 10))
+        base.append(_mk_vignette_row(age, gender, diags, los, prev, comp, rsh, shadm, sup, fup))
+    return pd.DataFrame(base)
+
+vignettes_df = build_vignettes_df(n=20, seed=77)
+buf_v = BytesIO(); vignettes_df.to_excel(buf_v, index=False); buf_v.seek(0)
+st.download_button("📥 Download Vignettes (20 cases, Excel)", buf_v,
+                   file_name="vignettes_20.xlsx",
+                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+st.caption("說明：請 3–5 位老師/督導獨立評每題風險（Low/Moderate/High 或 0–100）。回收後你可用這份檔案彙整一致度與可解釋性意見。")
+
