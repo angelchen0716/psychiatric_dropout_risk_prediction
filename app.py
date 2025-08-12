@@ -1,4 +1,5 @@
-# app.py — Psychiatric Dropout Risk (multi-diagnoses + balanced weights + policy overlay + global calibration + soft safety uplift + SHAP + Actions + Batch)
+# app.py — Psychiatric Dropout Risk
+# (multi-diagnoses + balanced weights + policy overlay + global calibration + smooth blend + border bands + SHAP + Actions + Batch)
 import os
 import re
 import streamlit as st
@@ -18,7 +19,7 @@ except Exception:
 st.set_page_config(page_title="Psychiatric Dropout Risk", layout="wide")
 st.title("🧠 Psychiatric Dropout Risk Predictor")
 
-# ==== Policy overlay helpers (logit space) ====
+# ==== Sigmoid / logit helpers ====
 def _sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
@@ -30,9 +31,11 @@ def _logit_vec(p, eps=1e-6):
     p = np.clip(p, eps, 1 - eps)
     return np.log(p / (1 - p))
 
-# === Global calibration (shift everything upward; adjustable in sidebar) ===
-CAL_LOGIT_SHIFT = float(os.getenv("RISK_CAL_SHIFT", "0.40"))  # default +0.40
-SOFT_UPLIFT = {"floor": 0.65, "add": 0.20, "cap": 0.95}      # self-harm uplift
+# === Global calibration + smoothing ===
+CAL_LOGIT_SHIFT = float(os.getenv("RISK_CAL_SHIFT", "0.40"))  # 全域校正（+ 往上、- 往下）
+SOFT_UPLIFT = {"floor": 0.65, "add": 0.20, "cap": 0.95}      # 自傷 uplift（下限/加成/上限）
+BLEND_W = 0.50                                               # 平滑混合權重：Final = (1-BLEND)*Model + BLEND*Overlay
+BORDER_BAND = 7                                              # 邊帶寬度（score 0–100）
 
 # 文獻啟發的政策疊加（log-odds）；性別預設不進分（多研究不穩定/常不顯著）
 POLICY = {
@@ -273,14 +276,18 @@ def flag_yes(row, prefix):
     col = f"{prefix}_Yes"
     return (col in row.index) and (row[col] == 1)
 
-# ====== Thresholds ======
+# ====== Thresholds + soft classification ======
 MOD_CUT = 20
 HIGH_CUT = 40
 def proba_to_percent(p): return float(p) * 100
 def proba_to_score(p): return int(round(proba_to_percent(p)))
-def classify(score):
-    if score >= HIGH_CUT: return "High"
-    if score >= MOD_CUT:  return "Moderate"
+
+def classify_soft(score, mod=MOD_CUT, high=HIGH_CUT, band=BORDER_BAND):
+    # 回傳 5 段：Low / Low–Moderate / Moderate / Moderate–High / High
+    if score >= high + band: return "High"
+    if score >= high - band: return "Moderate–High"
+    if score >= mod + band:  return "Moderate"
+    if score >= mod - band:  return "Low–Moderate"
     return "Low"
 
 # ====== Sidebar ======
@@ -319,7 +326,7 @@ set_onehot_by_prefix(X_final, "has_social_worker", social_worker)
 set_onehot_by_prefix(X_final, "has_recent_self_harm", recent_self_harm)
 set_onehot_by_prefix(X_final, "self_harm_during_admission", selfharm_adm)
 
-# ====== Predict (align + float32 + validate_features=False + policy overlay + calibration) ======
+# ====== Predict (align + float32 + validate_features=False + policy overlay + calibration + blending) ======
 X_aligned_df, used_names = align_df_to_model(X_final, model)
 X_np = to_float32_np(X_aligned_df)
 p_model = float(model.predict_proba(X_np, validate_features=False)[:, 1][0])
@@ -347,9 +354,12 @@ for dx, w in POLICY["diag"].items():
     if col in X_final.columns and X_final.at[0, col] == 1:
         lz += w
 
-# 全域校正（把整體機率抬高）
+# 全域校正後的 overlay 機率
 lz += CAL_LOGIT_SHIFT
-p_policy = _sigmoid(lz)
+p_overlay = _sigmoid(lz)
+
+# 平滑混合：避免特徵一切換 Final 就大跳
+p_policy = (1.0 - BLEND_W) * p_model + BLEND_W * p_overlay
 
 # ---- Soft safety uplift（不鎖死，只提升）----
 soft_reason = None
@@ -362,7 +372,7 @@ else:
 percent_model = proba_to_percent(p_model)
 percent = proba_to_percent(p_final)
 score = proba_to_score(p_final)
-level = classify(score)
+level = classify_soft(score)
 
 # ====== Model diagnostics ======
 with st.expander("Model diagnostics", expanded=False):
@@ -387,12 +397,17 @@ with c3: st.metric("Risk Score (0–100)", f"{score}")
 
 if soft_reason:
     st.warning(f"🟠 Soft safety uplift applied ({soft_reason}).")
-elif level == "High":
-    st.error("🔴 High Risk")
-elif level == "Moderate":
-    st.warning("🟡 Moderate Risk")
 else:
-    st.success("🟢 Low Risk")
+    if level == "High":
+        st.error("🔴 High Risk")
+    elif level == "Moderate–High":
+        st.warning("🟠 Moderate–High (borderline to High)")
+    elif level == "Moderate":
+        st.warning("🟡 Moderate Risk")
+    elif level == "Low–Moderate":
+        st.info("🔵 Low–Moderate (borderline to Moderate)")
+    else:
+        st.success("🟢 Low Risk")
 
 # ====== SHAP (version-agnostic via XGBoost pred_contribs) ======
 with st.expander("SHAP Explanation", expanded=True):
@@ -476,7 +491,14 @@ def personalized_actions(row: pd.Series):
         acts += [("Today","Clinician","Immediate psychiatric evaluation.")]
     return acts
 
-rows = BASE_ACTIONS[level] + personalized_actions(X_final.iloc[0])
+bucket = {
+    "High": "High",
+    "Moderate–High": "Moderate",  # 邊帶 → 用次高一級 SOP
+    "Moderate": "Moderate",
+    "Low–Moderate": "Low",        # 邊帶 → 用次低一級 SOP
+    "Low": "Low",
+}
+rows = BASE_ACTIONS[bucket[level]] + personalized_actions(X_final.iloc[0])
 seen, uniq = set(), []
 for r in rows:
     if r not in seen:
@@ -581,7 +603,7 @@ if uploaded is not None:
         Xb_np = to_float32_np(Xb_aligned)
         base_probs = model.predict_proba(Xb_np, validate_features=False)[:, 1]
 
-        # ---- Vectorized policy overlay for batch（多診斷可累加 + calibration）----
+        # ---- Vectorized policy overlay for batch（多診斷可累加 + calibration + blending）----
         lz = _logit_vec(base_probs)
         lz += POLICY["per_prev_admission"] * np.minimum(df["num_previous_admissions"].astype(float).to_numpy(), 5)
         lz += POLICY["per_point_low_compliance"] * np.maximum(0.0, 5.0 - df["medication_compliance_score"].astype(float).to_numpy())
@@ -602,9 +624,12 @@ if uploaded is not None:
                 diag_term += w * (df[col].to_numpy() == 1)
         lz += diag_term
 
-        # 全域校正
+        # 全域校正 + overlay 機率
         lz += CAL_LOGIT_SHIFT
-        p_policy = 1.0 / (1.0 + np.exp(-lz))
+        p_overlay = 1.0 / (1.0 + np.exp(-lz))
+
+        # 平滑混合：Final = (1-BLEND)*Model + BLEND*Overlay
+        p_policy = (1.0 - BLEND_W) * base_probs + BLEND_W * p_overlay
 
         # self-harm 的 soft uplift
         hrsh = df.get("has_recent_self_harm_Yes", 0)
@@ -619,9 +644,16 @@ if uploaded is not None:
         out = raw.copy()
         out["risk_percent"] = (adj_probs * 100).round(1)
         out["risk_score_0_100"] = (adj_probs * 100).round().astype(int)
-        out["risk_level"] = out["risk_score_0_100"].apply(
-            lambda s: "High" if s >= HIGH_CUT else ("Moderate" if s >= MOD_CUT else "Low")
-        )
+
+        # 邊帶分級（向量化）
+        s = out["risk_score_0_100"].to_numpy()
+        levels = np.full(s.shape, "Low", dtype=object)
+        levels[s >= MOD_CUT - BORDER_BAND] = "Low–Moderate"
+        levels[s >= MOD_CUT + BORDER_BAND] = "Moderate"
+        levels[s >= HIGH_CUT - BORDER_BAND] = "Moderate–High"
+        levels[s >= HIGH_CUT + BORDER_BAND] = "High"
+        out["risk_level"] = levels
+
         st.dataframe(out)
 
         buf_out = BytesIO(); out.to_csv(buf_out, index=False); buf_out.seek(0)
