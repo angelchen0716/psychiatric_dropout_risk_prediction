@@ -28,8 +28,8 @@ def _logit_vec(p, eps=1e-6):
     p = np.clip(p, eps, 1 - eps); return np.log(p / (1 - p))
 
 # === Global calibration + smoothing ===
-CAL_LOGIT_SHIFT = float(os.getenv("RISK_CAL_SHIFT", "0.40"))   # 全域校正（+ 往上、- 往下）
-SOFT_UPLIFT = {"floor": 0.65, "add": 0.20, "cap": 0.95}        # 自傷 uplift（下限/加成/上限）
+CAL_LOGIT_SHIFT = float(os.getenv("RISK_CAL_SHIFT", "0.40"))   # 全域校正
+SOFT_UPLIFT = {"floor": 0.65, "add": 0.20, "cap": 0.95}        # 自傷 uplift
 BLEND_W = 0.50                                                 # Final = (1-BLEND)*Model + BLEND*Overlay
 BORDER_BAND = 7                                                # 邊帶寬度（score 0–100）
 
@@ -53,36 +53,30 @@ TEMPLATE_COLUMNS = [
 
 # ====== Literature-inspired policy overlay weights (log-odds) ======
 POLICY = {
-    # 強影響
-    "per_prev_admission": 0.18,         # 每多 1 次既往住院 ↑ 0.18（上限 5 次）
-    "per_point_low_compliance": 0.24,   # (5 - compliance) 每 1 分 ↑ 0.24
-    "per_point_low_support": 0.20,      # (5 - family support) 每 1 分 ↑ 0.20
-    # 輕/中等影響
-    "per_followup": -0.15,              # 每 1 次出院追蹤 ↓ 0.15
-    "los_short": 0.45,                  # <3 天
-    "los_mid": 0.00,                    # 3–14 天
-    "los_mid_high": 0.15,               # 15–21 天
-    "los_long": 0.35,                   # >21 天
-    # 年齡極端
-    "age_young": 0.10,                  # <21 歲
-    "age_old": 0.10,                    # ≥75 歲
-    # 診斷（可複選相加）
+    "per_prev_admission": 0.18,
+    "per_point_low_compliance": 0.24,   # (5 - compliance)
+    "per_point_low_support": 0.20,      # (5 - family support)
+    "per_followup": -0.15,
+    "los_short": 0.45,                  # <3d
+    "los_mid": 0.00,                    # 3–14d
+    "los_mid_high": 0.15,               # 15–21d
+    "los_long": 0.35,                   # >21d
+    "age_young": 0.10,                  # <21
+    "age_old": 0.10,                    # ≥75
     "diag": {
         "Personality Disorder":    0.35,
         "Substance Use Disorder":  0.35,
         "Bipolar":                 0.10,
         "PTSD":                    0.10,
-        "Schizophrenia":           0.10,   # 改為微正向
-        "Depression":              0.05,   # 改為微正向
+        "Schizophrenia":           0.10,
+        "Depression":              0.05,
         "Anxiety":                 0.00,
         "OCD":                     0.00,
         "Dementia":                0.00,
         "ADHD":                    0.00,
         "Other/Unknown":           0.00,
     },
-    # 額外規則
-    "no_followup_extra": 0.20,          # 完全無追蹤的額外加罰
-    # 交互效應
+    "no_followup_extra": 0.20,          # 0 次追蹤的額外加罰
     "x_sud_lowcomp": 0.15,              # SUD × compliance≤3
     "x_pd_shortlos": 0.10,              # PD × LOS<3
 }
@@ -351,7 +345,7 @@ elif los <= 21:
 else:
     lz += add_driver("Very long stay (>21d)", POLICY["los_long"])
 
-# 年齡
+# 年齡（極端）
 age_val = float(X_final.at[0, "age"])
 if age_val < 21:
     lz += add_driver("Young age (<21)", POLICY["age_young"])
@@ -364,11 +358,12 @@ for dx, w in POLICY["diag"].items():
     if col in X_final.columns and X_final.at[0, col] == 1:
         lz += add_driver(f"Diagnosis: {dx}", w)
 
-# 交互效應
-has_sud = (X_final.get("diagnosis_Substance Use Disorder", 0) == 1)
-if has_sud and float(X_final.at[0, "medication_compliance_score"]) <= 3:
+# 交互效應（修正：用單列 row0 取得純量，避免 Series 布林歧義）
+row0 = X_final.iloc[0]
+has_sud = bool(row0.get("diagnosis_Substance Use Disorder", 0) == 1)
+if has_sud and float(row0["medication_compliance_score"]) <= 3:
     lz += add_driver("SUD × very low compliance", POLICY["x_sud_lowcomp"])
-has_pd = (X_final.get("diagnosis_Personality Disorder", 0) == 1)
+has_pd = bool(row0.get("diagnosis_Personality Disorder", 0) == 1)
 if has_pd and los < 3:
     lz += add_driver("PD × very short stay", POLICY["x_pd_shortlos"])
 
@@ -376,7 +371,7 @@ if has_pd and los < 3:
 lz += CAL_LOGIT_SHIFT
 p_overlay = _sigmoid(lz)
 
-# 平滑混合：避免特徵切換就大跳
+# 平滑混合
 p_policy = (1.0 - BLEND_W) * p_model + BLEND_W * p_overlay
 
 # ---- Soft safety uplift（不鎖死，只提升）----
@@ -481,7 +476,7 @@ with st.expander("SHAP Explanation (model component)", expanded=True):
     add_onehot("Self-harm During Admission","self_harm_during_admission", selfharm_adm)
 
     if len(vals) == 0:
-        st.caption("No SHAP contributions available."); 
+        st.caption("No SHAP contributions available.")
     else:
         order = np.argsort(np.abs(np.array(vals)))[::-1][:12]
         exp = shap.Explanation(
@@ -628,10 +623,10 @@ if uploaded is not None:
         lz += POLICY["no_followup_extra"] * (fup == 0)
 
         # LOS
-        los = df["length_of_stay"].astype(float).to_numpy()
-        lz += np.where(los < 3, POLICY["los_short"],
-                np.where(los <= 14, POLICY["los_mid"],
-                np.where(los <= 21, POLICY["los_mid_high"], POLICY["los_long"])))
+        los_arr = df["length_of_stay"].astype(float).to_numpy()
+        lz += np.where(los_arr < 3, POLICY["los_short"],
+                np.where(los_arr <= 14, POLICY["los_mid"],
+                np.where(los_arr <= 21, POLICY["los_mid_high"], POLICY["los_long"])))
 
         # 年齡極端
         age_arr = df["age"].astype(float).to_numpy()
@@ -652,7 +647,7 @@ if uploaded is not None:
         lz += POLICY["x_sud_lowcomp"] * (sud & very_low_comp)
 
         pd_mask = (df.get("diagnosis_Personality Disorder", 0).to_numpy() == 1)
-        lz += POLICY["x_pd_shortlos"] * (pd_mask & (los < 3))
+        lz += POLICY["x_pd_shortlos"] * (pd_mask & (los_arr < 3))
 
         # 校正 + 混合
         lz += CAL_LOGIT_SHIFT
@@ -682,11 +677,9 @@ if uploaded is not None:
         levels[s >= HIGH_CUT + BORDER_BAND] = "High"
         out["risk_level"] = levels
 
-        # （可選）輸出每筆 Top-3 policy drivers（字串）
+        # Top-3 policy drivers（字串）
         top3_list = []
         for i in range(len(df)):
-            row_drv = []
-            # 與單筆一致的貢獻計算（重現主要項，簡化版）
             contribs = []
             def push(name, val):
                 if val != 0: contribs.append((name, float(val)))
