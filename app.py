@@ -1393,4 +1393,4 @@ buf_v = BytesIO(); vignettes_df.to_excel(buf_v, index=False); buf_v.seek(0)
 st.download_button("📥 Download Vignettes (20 cases, Excel)", buf_v,
                    file_name="vignettes_20.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-st.caption("說明：請 3–5 位老師/督導獨立評每題風險（Low/Moderate/High 或 0–100）。回收後你可用這份檔案彙整一致度與可解釋性意見。")
+st.caption("說明：請 3–5 位老師獨立評每題風險（Low/Moderate/High 或 0–100）。回收後用這份檔案彙整一致度與可解釋性意見。")
