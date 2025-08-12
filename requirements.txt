@@ -7,3 +7,4 @@ shap
 matplotlib
 joblib
 openpyxl
+python-docx
