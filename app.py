@@ -1317,14 +1317,23 @@ st.download_button("📥 Download Vignettes (20 cases, Excel)", buf_v,
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # ====== Data dictionary ======
+# ====== Data dictionary ======
 with st.expander("📚 Data dictionary / Definitions", expanded=False):
     st.markdown(f"""
 - **Medication Compliance (0–10)**：0=幾乎不服藥；10=幾乎完全依從（近 1 個月）
 - **Family Support (0–10)**：0=非常不足；10=非常充足
 - **Financial Strain (0–10)**：0=無壓力；10=極高壓力
-- **{FOLLOWUPS_LABEL}**：出院後 30 天內的門診/電話/社工接觸次數
+- **{FOLLOWUPS_LABEL}**：出院後 30 天內的門診/電話/社工接觸次數（本系統一律以 30 天統一定義）
 - **Self-harm flags**：最近自傷 / 住院期間自傷
-- **Chief Complaint(s)**：本次住院的主要問題，可複選
-- **Bipolar Episode**：區分 Manic/Depressive/Mixed/Hypomanic/N/A
-- **Pre-planning**：忽略 30 天追蹤次數（避免洩漏）
-- **
+- **Chief Complaint(s)**：本次住院的主要問題（可複選），如自殺意念/自傷、攻擊行為、躁動等
+- **Bipolar Episode**：Manic / Depressive / Mixed / Hypomanic / N/A
+- **Pre-planning 模式**：為避免洩漏，計算時忽略 30 天追蹤次數特徵
+- **Final Probability**：Model 與 Policy Overlay 混合（可調 BLEND），並含必要的 safety uplift（自傷相關個案至少 0.6 起跳後再疊加）
+- **Risk bins**：Low(<~13)、Low–Moderate(≈13–27)、Moderate(≈27–33)、Moderate–High(≈33–47)、High(>~47)；實際由門檻與緩衝帶計算（可在 Validation 區調整）
+- **Decision Curve (Net Benefit)**：NB = TP/N − FP/N × (t/(1−t))，比較模型決策與 treat-all / treat-none 的淨效益
+- **ECE (Expected Calibration Error)**：分箱後 |預測機率 − 實際發生率| 的加權平均，衡量校準度
+- **用途定位**：臨床決策輔助（CDSS），非取代臨床判斷；高風險個案需人工覆核並保留稽核紀錄
+""")
+
+st.caption("Demo 版以合成資料 + 臨床啟發規則做示範；臨床部署前需以院內實證數據訓練/驗證並通過 IRB 與資安稽核。")
+
