@@ -159,7 +159,7 @@ POLICY = {
     # age ends
     "age_young": 0.10, "age_old": 0.10,
 
-    # Dx weights (unchanged)
+    # Dx weights
     "diag": {
         "Personality Disorder":    0.35,
         "Substance Use Disorder":  0.35,
@@ -450,14 +450,14 @@ def predict_model_proba(df_aligned: pd.DataFrame):
             pass
     return probs
 
-# ====== Overlay（單例 + 驅動因子）=====
-def overlay_single_and_drivers(X1: pd.DataFrame, include_followup_effect: bool = True):
+# ====== Overlay（單例 + 驅動因子）======
+def overlay_single_and_drivers(X1: pd.DataFrame, base_prob: float, include_followup_effect: bool = True):
     row = X1.iloc[0]
     drivers = []
     def add(label, val):
         if val != 0: drivers.append((label, float(val)))
         return val
-    base_logit = _logit( float(model.predict_proba(X1, validate_features=False)[:,1][0]) )
+    base_logit = _logit(float(base_prob))
     lz = base_logit
 
     # pull values
@@ -561,7 +561,7 @@ if not use_followups_feature:
 # 預測（model + overlay + blend + uplift）
 X_align, _ = align_df_to_model(X_used, model)
 p_model = float(predict_model_proba(X_align)[0])
-p_overlay, drivers = overlay_single_and_drivers(X_used, include_followup_effect=use_followups_feature)
+p_overlay, drivers = overlay_single_and_drivers(X_used, base_prob=p_model, include_followup_effect=use_followups_feature)
 p_final = (1.0 - BLEND_W) * p_model + BLEND_W * p_overlay
 
 # 自傷 uplift
@@ -802,7 +802,7 @@ with st.expander("🧪 What-if: adjust followups/compliance and recompute", expa
     X_wf.at[0,"medication_compliance_score"] = wf_comp
     X_wf_al, _ = align_df_to_model(X_wf, model)
     p_m_wf = float(predict_model_proba(X_wf_al)[0])
-    p_o_wf, _ = overlay_single_and_drivers(X_wf, include_followup_effect=use_followups_feature)
+    p_o_wf, _ = overlay_single_and_drivers(X_wf, base_prob=p_m_wf, include_followup_effect=use_followups_feature)
     p_f_wf = (1.0 - BLEND_W) * p_m_wf + BLEND_W * p_o_wf
     st.write(f"Model={p_m_wf*100:.1f}% | Overlay={p_o_wf*100:.1f}% | Final={p_f_wf*100:.1f}%")
 
@@ -1327,6 +1327,4 @@ with st.expander("📚 Data dictionary / Definitions", expanded=False):
 - **Chief Complaint(s)**：本次住院的主要問題，可複選
 - **Bipolar Episode**：區分 Manic/Depressive/Mixed/Hypomanic/N/A
 - **Pre-planning**：忽略 30 天追蹤次數（避免洩漏）
-- **Final Probability**：Model 與 Policy Overlay 的混合（可調 BLEND），含必要安全 uplift
-""")
-
+- **
