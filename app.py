@@ -924,4 +924,274 @@ def generate_synth_holdout(n=20000, seed=2024):
     ptsd_flag = (df["diagnosis_PTSD"] == 1).to_numpy()
     sud_flag  = (df["diagnosis_Substance Use Disorder"] == 1).to_numpy()
     prob_sh = 0.18 + 0.12*pd_flag + 0.10*ptsd_flag + 0.10*sud_flag
-    r1 = (base
+    r1 = (base_r < np.clip(prob_sh, 0, 0.9)).astype(int)
+    r2 = (rng.random(n) < 0.12).astype(int)
+    df.loc[r1 == 1, "has_recent_self_harm_Yes"] = 1; df.loc[r1 == 0, "has_recent_self_harm_No"] = 1
+    df.loc[r2 == 1, "self_harm_during_admission_Yes"] = 1; df.loc[r2 == 0, "self_harm_during_admission_No"] = 1
+
+    # 真值（與訓練合成一致）
+    beta0 = -0.60
+    beta = {"has_recent_self_harm_Yes":0.80,"self_harm_during_admission_Yes":0.60,
+            "prev_adm_ge2":0.60,"medication_compliance_per_point":-0.25,"family_support_per_point":-0.20,
+            "followups_per_visit":-0.15,"length_of_stay_per_day":0.04}
+    beta_diag = {"Personality Disorder":0.35,"Substance Use Disorder":0.35,"Bipolar":0.10,"PTSD":0.10,"Schizophrenia":0.10,"Depression":0.05,
+                 "Anxiety":0.00,"OCD":0.00,"Dementia":0.00,"ADHD":0.00,"Other/Unknown":0.00}
+    prev_ge2 = (df["num_previous_admissions"] >= 2).astype(np.float32)
+    logit = (beta0
+             + beta["has_recent_self_harm_Yes"]*df["has_recent_self_harm_Yes"]
+             + beta["self_harm_during_admission_Yes"]*df["self_harm_during_admission_Yes"]
+             + beta["prev_adm_ge2"]*prev_ge2
+             + beta["medication_compliance_per_point"]*df["medication_compliance_score"]
+             + beta["family_support_per_point"]*df["family_support_score"]
+             + beta["followups_per_visit"]*df["post_discharge_followups"]
+             + beta["length_of_stay_per_day"]*df["length_of_stay"])
+    for d,w in beta_diag.items(): logit = logit + w*df[f"diagnosis_{d}"]
+    noise = np.random.default_rng(seed+1).normal(0.0, 0.35, n).astype(np.float32)
+    p_true = 1.0 / (1.0 + np.exp(-(logit + noise)))
+    y_true = (np.random.default_rng(seed+2).random(n) < p_true).astype(int)
+
+    fill_defaults_batch(df)
+    return df, y_true
+
+def plot_roc_pr(y, p_list, labels):
+    from sklearn.metrics import roc_curve, auc, precision_recall_curve, average_precision_score
+    # ROC
+    fig1, ax1 = plt.subplots()
+    for p,l in zip(p_list, labels):
+        fpr, tpr, _ = roc_curve(y, p); roc = auc(fpr, tpr)
+        ax1.plot(fpr, tpr, label=f"{l} AUC={roc:.3f}")
+    ax1.plot([0,1],[0,1],"--")
+    ax1.set_xlabel("FPR"); ax1.set_ylabel("TPR"); ax1.set_title("ROC")
+    ax1.legend(loc="lower right"); st.pyplot(fig1, clear_figure=True)
+    # PR
+    fig2, ax2 = plt.subplots()
+    for p,l in zip(p_list, labels):
+        prec, rec, _ = precision_recall_curve(y, p); ap = average_precision_score(y, p)
+        ax2.plot(rec, prec, label=f"{l} AP={ap:.3f}")
+    ax2.set_xlabel("Recall"); ax2.set_ylabel("Precision"); ax2.set_title("PR")
+    ax2.legend(loc="upper right"); st.pyplot(fig2, clear_figure=True)
+
+def ece(y, p, n_bins=10):
+    bins = np.linspace(0.0,1.0,n_bins+1)
+    idx = np.digitize(p, bins)-1
+    err=0.0
+    for b in range(n_bins):
+        m=(idx==b)
+        if m.sum()==0: continue
+        fp=p[m].mean(); tp=y[m].mean()
+        err += m.mean()*abs(tp-fp)
+    return float(err)
+
+def confusion(y, p, thr):
+    from sklearn.metrics import confusion_matrix
+    yhat = (p>=thr).astype(int)
+    tn,fp,fn,tp = confusion_matrix(y,yhat).ravel()
+    return tn,fp,fn,tp
+
+def decision_curve(y, p):
+    # Net Benefit across thresholds 0.05~0.60
+    ths = np.linspace(0.05,0.60,56)
+    N=len(y)
+    nb=[]
+    for t in ths:
+        yhat = (p>=t).astype(int)
+        tp = ((yhat==1)&(y==1)).sum(); fp=((yhat==1)&(y==0)).sum()
+        nb.append((tp/N) - (fp/N)*(t/(1-t)))
+    return ths, np.array(nb)
+
+if run_val:
+    try:
+        from sklearn.metrics import roc_auc_score, average_precision_score, brier_score_loss
+    except Exception as e:
+        st.error(f"Need scikit-learn: {e}")
+    else:
+        with st.spinner("Generating data & evaluating..."):
+            df_syn, y_true = generate_synth_holdout(n_val, seed_val)
+            if not use_followups_feature:
+                df_syn["post_discharge_followups"] = 0
+            Xa, _ = align_df_to_model(df_syn, model)
+            p_model_v = predict_model_proba(Xa)
+
+            # Overlay-only（BLEND=1）
+            def overlay_only_vec(df_feat, base_probs):
+                base = _logit_vec(base_probs); lz = base.copy()
+                adm = pd.to_numeric(df_feat["num_previous_admissions"], errors="coerce").fillna(DEFAULTS["num_previous_admissions"]).to_numpy()
+                comp= pd.to_numeric(df_feat["medication_compliance_score"], errors="coerce").fillna(DEFAULTS["medication_compliance_score"]).to_numpy()
+                sup = pd.to_numeric(df_feat["family_support_score"], errors="coerce").fillna(DEFAULTS["family_support_score"]).to_numpy()
+                fup = pd.to_numeric(df_feat["post_discharge_followups"], errors="coerce").fillna(DEFAULTS["post_discharge_followups"]).to_numpy()
+                los = pd.to_numeric(df_feat["length_of_stay"], errors="coerce").fillna(DEFAULTS["length_of_stay"]).to_numpy()
+                agev= pd.to_numeric(df_feat["age"], errors="coerce").fillna(DEFAULTS["age"]).to_numpy()
+
+                lz += POLICY["per_prev_admission"] * np.minimum(adm, 5)
+                lz += POLICY["per_point_low_support"] * np.maximum(0.0, 5.0 - sup)
+                lz += POLICY["per_point_low_compliance"] * np.maximum(0.0, 5.0 - comp)
+                lz += POLICY["per_point_high_compliance_protect"] * np.maximum(0.0, comp - 7.0)
+
+                # Overlay window：驗證時固定 14d 權重（或可做成 slider）
+                w = np.sqrt(14.0 / 14.0)
+                eff_followups = fup * np.clip(w, 0.5, 1.5)
+                lz += POLICY["per_followup"] * eff_followups
+                lz += POLICY["no_followup_extra"] * (fup == 0)
+
+                lz += np.where(los < 3, POLICY["los_short"],
+                        np.where(los <= 14, POLICY["los_mid"],
+                        np.where(los <= 21, POLICY["los_mid_high"], POLICY["los_long"])))
+                lz += POLICY["age_young"] * (agev < 21) + POLICY["age_old"]*(agev >= 75)
+                for dx,wg in POLICY["diag"].items():
+                    col=f"diagnosis_{dx}"
+                    if col in df_feat.columns: lz += wg * (df_feat[col].to_numpy()==1)
+                sud = (df_feat.get("diagnosis_Substance Use Disorder",0).to_numpy()==1)
+                pdm = (df_feat.get("diagnosis_Personality Disorder",0).to_numpy()==1)
+                lz += POLICY["x_sud_lowcomp"] * (sud & (comp <= 3))
+                lz += POLICY["x_pd_shortlos"] * (pdm & (los < 3))
+                delta = np.clip(OVERLAY_SCALE * (lz - base), -DELTA_CLIP, DELTA_CLIP)
+                lz2 = base + delta + CAL_LOGIT_SHIFT
+                return 1.0 / (1.0 + np.exp(-(lz2 / TEMP)))
+
+            p_overlay_v = overlay_only_vec(df_syn, p_model_v)
+            p_final_v = (1.0 - BLEND_W_DEFAULT) * p_model_v + BLEND_W_DEFAULT * p_overlay_v
+
+            # Metrics 表
+            auc_m = roc_auc_score(y_true, p_model_v); auc_o = roc_auc_score(y_true, p_overlay_v); auc_f = roc_auc_score(y_true, p_final_v)
+            ap_m  = average_precision_score(y_true, p_model_v); ap_o  = average_precision_score(y_true, p_overlay_v); ap_f  = average_precision_score(y_true, p_final_v)
+            br_m  = brier_score_loss(y_true, p_model_v); br_o  = brier_score_loss(y_true, p_overlay_v); br_f  = brier_score_loss(y_true, p_final_v)
+            ece_m = ece(y_true, p_model_v); ece_o = ece(y_true, p_overlay_v); ece_f = ece(y_true, p_final_v)
+            st.subheader("Ablation metrics")
+            st.dataframe(pd.DataFrame([
+                {"Model":"Model","AUC":auc_m,"PR-AUC":ap_m,"Brier":br_m,"ECE(10bins)":ece_m},
+                {"Model":"Overlay-only","AUC":auc_o,"PR-AUC":ap_o,"Brier":br_o,"ECE(10bins)":ece_o},
+                {"Model":"Blend (Final)","AUC":auc_f,"PR-AUC":ap_f,"Brier":br_f,"ECE(10bins)":ece_f},
+            ]).round(3), use_container_width=True)
+
+            st.subheader("Curves")
+            plot_roc_pr(y_true, [p_model_v, p_overlay_v, p_final_v], ["Model","Overlay","Final"])
+
+            # Decision Curve
+            ths_m, nb_m = decision_curve(y_true, p_model_v)
+            ths_o, nb_o = decision_curve(y_true, p_overlay_v)
+            ths_f, nb_f = decision_curve(y_true, p_final_v)
+            fig, ax = plt.subplots()
+            ax.plot(ths_m, nb_m, label="Model")
+            ax.plot(ths_o, nb_o, label="Overlay")
+            ax.plot(ths_f, nb_f, label="Final")
+            ax.axhline(0, ls="--"); ax.set_xlabel("Threshold"); ax.set_ylabel("Net benefit"); ax.set_title("Decision Curve")
+            ax.legend(); st.pyplot(fig, clear_figure=True)
+
+            # Confusion + Capacity（以門檻計）
+            thr_mod = pt_low/100.0; thr_hi = pt_high/100.0
+            st.subheader("Operational (binary @ thresholds)")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown(f"**Moderate ≥{pt_low}%**")
+                for name, p in [("Model",p_model_v),("Overlay",p_overlay_v),("Final",p_final_v)]:
+                    tn,fp,fn,tp = confusion(y_true, p, thr_mod)
+                    st.write(f"{name} — TN:{tn} FP:{fp} FN:{fn} TP:{tp}")
+            with c2:
+                st.markdown(f"**High ≥{pt_high}%**")
+                for name, p in [("Model",p_model_v),("Overlay",p_overlay_v),("Final",p_final_v)]:
+                    tn,fp,fn,tp = confusion(y_true, p, thr_hi)
+                    st.write(f"{name} — TN:{tn} FP:{fp} FN:{fn} TP:{tp}")
+
+            # Capacity & time load（簡易估算）
+            st.subheader("Capacity / Time load (per 1,000 patients)")
+            N = 1000
+            def count_at(p, thr): return int(((p>=thr).sum() / len(p)) * N)
+            mod_cnt = count_at(p_final_v, thr_mod); high_cnt = count_at(p_final_v, thr_hi)
+            st.caption("Assumptions (editable):")
+            t_outreach = st.number_input("Nurse outreach (min)", 5, 60, 15, 5)
+            t_sched = st.number_input("Scheduler booking (min)", 2, 30, 5, 1)
+            t_pharm = st.number_input("Pharmacist review (min)", 5, 60, 20, 5)
+            hours = (mod_cnt*(t_outreach+t_sched) + (high_cnt)*(t_pharm)) / 60.0
+            st.write(f"Flagged Moderate+ per 1,000: **{mod_cnt}** ; High: **{high_cnt}** → ~ **{hours:.1f} hours** total effort.")
+
+            # Fairness：性別/年齡段/主診斷
+            st.subheader("Fairness (AUC / ECE by subgroup, Final)")
+            def subgroup_auc_ece(df_feat, y, p, mask):
+                if mask.sum()<100: return np.nan, np.nan
+                from sklearn.metrics import roc_auc_score
+                return float(roc_auc_score(y[mask], p[mask])), float(ece(y[mask], p[mask], 10))
+            agev = pd.to_numeric(df_syn["age"], errors="coerce").fillna(40).to_numpy()
+            bands = {"<30": (agev<30), "30–59": ((agev>=30)&(agev<60)), "≥60": (agev>=60)}
+            rows=[]
+            for g in GENDER_LIST:
+                mask = (df_syn.get(f"gender_{g}",0).to_numpy()==1)
+                a,e = subgroup_auc_ece(df_syn, y_true, p_final_v, mask)
+                rows.append({"group":"Gender", "value":g, "AUC":a, "ECE":e})
+            for k,m in bands.items():
+                a,e = subgroup_auc_ece(df_syn, y_true, p_final_v, m)
+                rows.append({"group":"AgeBand", "value":k, "AUC":a, "ECE":e})
+            diag_cols=[f"diagnosis_{d}" for d in DIAG_LIST]
+            prim = np.argmax(df_syn[diag_cols].to_numpy(), axis=1)
+            for i,d in enumerate(DIAG_LIST):
+                mask = (prim==i)
+                a,e = subgroup_auc_ece(df_syn, y_true, p_final_v, mask)
+                rows.append({"group":"PrimaryDx", "value":d, "AUC":a, "ECE":e})
+            st.dataframe(pd.DataFrame(rows).round(3), use_container_width=True)
+
+        st.success("Validation finished.")
+
+# ====== Vignettes（for expert review）======
+st.markdown("---")
+st.header("🧾 Vignettes template (for expert review)")
+def _mk_vignette_row(age, gender, diags, los, prev, comp, rsh, shadm, sup, fup):
+    return {
+        "Age": age, "Gender": gender, "Diagnoses": ", ".join(diags),
+        "Length of Stay (days)": los, "Previous Admissions (1y)": prev,
+        "Medication Compliance Score (0–10)": comp,
+        "Family Support Score (0–10)": sup,
+        "Post-discharge Followups (count)": fup,
+        "Recent Self-harm": rsh, "Self-harm During Admission": shadm,
+        "Expert Risk (Low/Moderate/High or 0–100)": ""
+    }
+def build_vignettes_df(n=20, seed=77):
+    rng = np.random.default_rng(seed); base=[]
+    protos = [
+        (19,"Female",["Depression"],2,0,3,"No","No",2,0),
+        (28,"Male",["Substance Use Disorder"],1,3,2,"No","No",3,0),
+        (35,"Male",["Bipolar"],6,1,4,"No","No",5,1),
+        (42,"Female",["Personality Disorder"],2,2,3,"No","No",4,0),
+        (55,"Male",["Schizophrenia"],10,4,5,"No","No",5,2),
+        (63,"Female",["PTSD"],4,1,6,"No","No",6,1),
+        (72,"Male",["Depression","Anxiety"],5,0,7,"No","No",7,2),
+        (23,"Female",["OCD"],3,0,8,"No","No",8,2),
+        (31,"Male",["Substance Use Disorder","Depression"],7,2,3,"No","No",3,0),
+        (47,"Female",["Personality Disorder","PTSD"],2,1,4,"No","No",4,0),
+        (38,"Male",["ADHD"],4,0,6,"No","No",6,1),
+        (26,"Female",["Anxiety"],1,0,5,"No","No",5,1),
+        (60,"Male",["Dementia"],12,1,6,"No","No",6,2),
+        (45,"Female",["Schizophrenia","Substance Use Disorder"],9,3,2,"No","No",3,0),
+        (52,"Male",["Bipolar","Personality Disorder"],2,2,3,"No","No",4,0),
+        (33,"Female",["Depression"],3,0,8,"No","No",8,3),
+        (29,"Male",["Substance Use Disorder"],5,2,2,"No","No",4,0),
+        (70,"Female",["Depression","PTSD"],8,1,5,"No","No",6,2),
+        (41,"Male",["Personality Disorder","Substance Use Disorder"],2,3,3,"No","No",3,0),
+        (36,"Female",["Other/Unknown"],4,0,5,"No","No",5,1),
+    ]
+    for i in range(min(n, len(protos))): base.append(_mk_vignette_row(*protos[i]))
+    for _ in range(len(base), n):
+        age = int(np.clip(rng.normal(40,15), 18, 90))
+        gender = GENDER_LIST[int(rng.integers(0,len(GENDER_LIST)))]
+        k = int(rng.integers(1,3)); diags = list(rng.choice(DIAG_LIST, size=k, replace=False))
+        los = int(np.clip(rng.normal(21,7),1,60)); prev = int(np.clip(rng.poisson(1.0),0,8))
+        comp = float(np.clip(rng.normal(6,2.5),0,10)); rsh = rng.choice(["Yes","No"]); shadm = rng.choice(["Yes","No"])
+        sup = float(np.clip(rng.normal(5,2.5),0,10)); fup = int(np.clip(rng.integers(0,4),0,10))
+        base.append(_mk_vignette_row(age, gender, diags, los, prev, comp, rsh, shadm, sup, fup))
+    return pd.DataFrame(base)
+
+vdf = build_vignettes_df(20, 77)
+buf_v = BytesIO(); vdf.to_excel(buf_v, index=False); buf_v.seek(0)
+st.download_button("📥 Download Vignettes (20 cases, Excel)", buf_v,
+                   file_name="vignettes_20.xlsx",
+                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# ====== Data dictionary ======
+with st.expander("📚 Data dictionary / Definitions", expanded=False):
+    st.markdown(f"""
+- **Medication Compliance (0–10)**：0=幾乎不服藥；10=幾乎完全依從（近 1 個月）
+- **Family Support (0–10)**：0=非常不足；10=非常充足
+- **Post-discharge Followups (count)**：出院後 **Follow-up window (days)** 內的「門診回診 / 電話關懷 / 社工或個管接觸」次數總和。
+- **Follow-up window (days)**：計算 followups 的時間窗；**視窗越短，保護效果越強**（以 14 天為基準做權重）。
+- **Pre-planning**：模型不吃 followups（避免洩漏），但 **Overlay** 仍將「已規劃的追蹤」視為保護，**Final** 因而改變。
+- **Post-planning**：Overlay 反映實際追蹤帶來的風險變化，便於動態監測。
+- **Final Probability**：Model 與 Policy Overlay 的混合（BLEND={BLEND_W_DEFAULT:.2f}），含必要安全 uplift（自傷）。
+""")
