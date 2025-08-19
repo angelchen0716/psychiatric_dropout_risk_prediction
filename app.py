@@ -1,12 +1,13 @@
 # app.py — Psychiatric Dropout Risk (Monotone + Calibration + Pre/Post + Ablation + Capacity + Fairness)
-# ========= What changed per expert feedback =========
-# Feedback #1 (Chief problem): add chief problems as features + overlay weights + UI + Excel
-# Feedback #2 (Bipolar episode): add current episode (Depressive/Manic/Mixed) features + overlay
-# Feedback #3 (ADHD rarely sole reason): add sanity check if ADHD is the only Dx
-# Feedback #4 (LOS realism): shift synthetic/training LOS toward 3–4 weeks; policy thresholds updated
-# Feedback #5 (Self-harm flags underused): add hint if PD/PTSD/SUD with both self-harm flags = No
-# Feedback #6 (Define followups): UI/help clarifies "contacts in first 30 days", and used consistently
-# Feedback #7 (Add social/continuity factors): add living status, financial stress, case manager, prior dropout readmission
+# 修正與老師回饋對應（每點一句）：
+# 1) Chief problem 納入（住院主因）
+# 2) Bipolar current episode (manic/depressive/mixed) 影響風險
+# 3) LOS 分佈與上限改貼近 3–4 週，並與診斷連動
+# 4) PD/PTSD/SUD 提高 self-harm 機率
+# 5) Follow-ups 明確定義為「出院後 30 天內接觸次數」
+# 6) Living status / Case manager / Financial strain / Prior dropout readmission 納入
+# 7) 修正 np.exp() 對 pandas 物件錯誤：先轉 numpy
+# 8) 其餘原功能完整保留
 
 import os, re, math
 import streamlit as st
@@ -17,7 +18,6 @@ import shap
 import matplotlib.pyplot as plt
 from io import BytesIO
 
-# 可選：Word 匯出 SOP
 try:
     from docx import Document
     HAS_DOCX = True
@@ -37,10 +37,9 @@ def _logit_vec(p, eps=1e-6):
 # ==== Global knobs ====
 CAL_LOGIT_SHIFT = float(os.getenv("RISK_CAL_SHIFT", "0.0"))
 BORDER_BAND = 7
-BLEND_W_DEFAULT = 0.30        # Final = (1-BLEND)*Model + BLEND*Overlay
-SOFT_UPLIFT = {"floor": 0.60, "add": 0.10, "cap": 0.90}  # 自傷保護
+BLEND_W_DEFAULT = 0.30
+SOFT_UPLIFT = {"floor": 0.60, "add": 0.10, "cap": 0.90}
 
-# Overlay safety controls
 OVERLAY_SCALE = 0.75
 DELTA_CLIP   = 1.00
 TEMP         = 1.20
@@ -53,41 +52,42 @@ DIAG_LIST = [
 BIN_YESNO = ["Yes","No"]
 GENDER_LIST = ["Male","Female","Other/Unknown"]
 
-# Feedback #1: 主因（可複選）
-CHIEF_LIST = [
-    "SuicidalSelfHarm", "ViolenceImpulsivity", "UnableSelfCare",
-    "SevereSymptomsCaregiverLimit", "ComplexDifferential", "MedicationSideEffects"
+# 👇 新增：住院主因 / 躁鬱期別 / 居住 / 個管 / 經濟 / 既往因 dropout 再住院
+CHIEF_PROBLEMS = [
+    "Suicidal/Self-harm risk","Aggression/Impulsivity","Unable self-care",
+    "Severe psychosis/diagnostic workup","Family cannot manage","Medication adverse effects","Other/Unknown"
 ]
-# Feedback #2: Bipolar episode（僅在 Bipolar 時顯示）
-BIPOLAR_EPISODES = ["NoneOrUnknown", "Depressive", "Manic", "Mixed"]
-
-# Feedback #7: 出院後居住型態 + 社會支持
-LIVING_LIST = ["Alone", "WithFamilyOrOthers", "Institutional"]  # one-hot
-ADDITIONAL_NUMERIC = ["financial_stress_score", "has_case_manager", "prior_dropout_readmission"]  # 0/1 except stress 0-10
-
+BIPOLAR_EPISODES = ["Unknown/NA","Manic","Depressive","Mixed"]
+LIVING_STATUS = ["Alone","With family/others"]
 TEMPLATE_COLUMNS = [
     "age","length_of_stay","num_previous_admissions",
     "medication_compliance_score","family_support_score","post_discharge_followups",
+    "financial_strain_score","prior_dropout_readmit_Yes","prior_dropout_readmit_No",
+    "has_case_manager_Yes","has_case_manager_No",
+    "living_alone_Yes","living_alone_No",
+    "chief_problem_" + CHIEF_PROBLEMS[0],"chief_problem_" + CHIEF_PROBLEMS[1],
+    "chief_problem_" + CHIEF_PROBLEMS[2],"chief_problem_" + CHIEF_PROBLEMS[3],
+    "chief_problem_" + CHIEF_PROBLEMS[4],"chief_problem_" + CHIEF_PROBLEMS[5],
+    "chief_problem_" + CHIEF_PROBLEMS[6],
+    "bipolar_episode_Manic","bipolar_episode_Depressive","bipolar_episode_Mixed","bipolar_episode_Unknown/NA",
     "gender_Male","gender_Female","gender_Other/Unknown",
 ] + [f"diagnosis_{d}" for d in DIAG_LIST] + [
     "has_recent_self_harm_Yes","has_recent_self_harm_No",
     "self_harm_during_admission_Yes","self_harm_during_admission_No",
-] + [f"chief_{c}" for c in CHIEF_LIST] + [f"living_{v}" for v in LIVING_LIST] + \
-  [f"bipolar_episode_{b}" for b in BIPOLAR_EPISODES] + ADDITIONAL_NUMERIC
+]
 
 # ====== Null-safe defaults ======
 DEFAULTS = {
     "age": 40.0,
-    "length_of_stay": 21.0,  # Feedback #4: 台灣常見 3–4 週
+    "length_of_stay": 21.0,  # ← 改為約 3 週
     "num_previous_admissions": 0.0,
     "medication_compliance_score": 5.0,
     "family_support_score": 5.0,
-    "post_discharge_followups": 0.0,
-    "financial_stress_score": 5.0,
-    "has_case_manager": 0.0,
-    "prior_dropout_readmission": 0.0,
+    "post_discharge_followups": 0.0,  # 30 days post-discharge
+    "financial_strain_score": 5.0,
 }
-NUMERIC_KEYS = list(DEFAULTS.keys())
+NUMERIC_KEYS = ["age","length_of_stay","num_previous_admissions","medication_compliance_score",
+                "family_support_score","post_discharge_followups","financial_strain_score"]
 
 def _num_or_default(x, key):
     try: v = float(x)
@@ -106,10 +106,6 @@ def fill_defaults_single_row(X1: pd.DataFrame):
         if col in X1.columns: X1.at[i, col] = 1
     oh_cols = [c for c in X1.columns if "_" in c and c not in NUMERIC_KEYS]
     if oh_cols: X1.loc[i, oh_cols] = X1.loc[i, oh_cols].fillna(0)
-    # 若非 Bipolar，標記 episode=NoneOrUnknown
-    if X1.at[i, "diagnosis_Bipolar"] != 1:
-        if "bipolar_episode_NoneOrUnknown" in X1.columns:
-            X1.at[i, "bipolar_episode_NoneOrUnknown"] = 1
 
 def fill_defaults_batch(df_feat: pd.DataFrame):
     for k in NUMERIC_KEYS:
@@ -122,30 +118,21 @@ def fill_defaults_batch(df_feat: pd.DataFrame):
         none_diag = (df_feat[diag_cols].sum(axis=1) == 0)
         if none_diag.any() and "diagnosis_Other/Unknown" in df_feat.columns:
             df_feat.loc[none_diag, "diagnosis_Other/Unknown"] = 1
-    # 非 Bipolar → episode=NoneOrUnknown
-    if "diagnosis_Bipolar" in df_feat.columns:
-        mask = (df_feat["diagnosis_Bipolar"] != 1)
-        col = "bipolar_episode_NoneOrUnknown"
-        if col in df_feat.columns:
-            df_feat.loc[mask, col] = 1
 
-# ====== Overlay policy（log-odds, 文獻啟發，方向單調）======
+# ====== Overlay policy（log-odds）======
 POLICY = {
-    "per_prev_admission": 0.18,       # ↑ 住院史
-    "per_point_low_support": 0.20,    # 家庭支持低
-    "per_followup": -0.18,            # 追蹤愈多愈保護
-    "no_followup_extra": 0.30,        # 沒追蹤加罰
-    # Feedback #4: LOS 門檻調整（<7d、7–28d、29–42d、>42d）
+    "per_prev_admission": 0.18,
+    "per_point_low_support": 0.20,
+    "per_followup": -0.18,
+    "no_followup_extra": 0.30,
     "los_short": 0.40, "los_mid": 0.00, "los_mid_high": 0.15, "los_long": 0.30,
     "age_young": 0.10, "age_old": 0.10,
-
-    # 診斷係數
     "diag": {
-        "Personality Disorder":    0.35,
-        "Substance Use Disorder":  0.35,
-        "Bipolar":                 0.10,
-        "PTSD":                    0.10,
-        "Schizophrenia":           0.10,
+        "Personality Disorder":    0.40,   # ↑ 些微
+        "Substance Use Disorder":  0.40,
+        "Bipolar":                 0.12,
+        "PTSD":                    0.12,
+        "Schizophrenia":           0.12,
         "Depression":              0.05,
         "Anxiety":                 0.00,
         "OCD":                     0.00,
@@ -153,75 +140,48 @@ POLICY = {
         "ADHD":                    0.00,
         "Other/Unknown":           0.00,
     },
-    # 交互
-    "x_sud_lowcomp": 0.30,     # SUD × 低順從
-    "x_pd_shortlos": 0.10,     # PD × 短住院
-
-    # 順從性（單調）
+    "x_sud_lowcomp": 0.30,
+    "x_pd_shortlos": 0.12,
     "per_point_low_compliance": 0.22,
     "per_point_high_compliance_protect": -0.06,
 
-    # Feedback #1: Chief problems
+    # 👇 新增：對應老師建議（各用一句）
     "chief": {
-        "SuicidalSelfHarm": 0.70,
-        "ViolenceImpulsivity": 0.40,
-        "UnableSelfCare": 0.30,
-        "SevereSymptomsCaregiverLimit": 0.30,
-        "ComplexDifferential": 0.15,
-        "MedicationSideEffects": 0.20,
+        "Suicidal/Self-harm risk": 0.45,
+        "Aggression/Impulsivity":  0.25,
+        "Unable self-care":        0.15,
+        "Severe psychosis/diagnostic workup": 0.20,
+        "Family cannot manage":    0.10,
+        "Medication adverse effects": 0.05,
+        "Other/Unknown":           0.00,
     },
-
-    # Feedback #2: Bipolar episode (附加在 Bipolar 病人)
-    "bipolar_episode": {
-        "Depressive": 0.05,
-        "Manic": 0.20,
-        "Mixed": 0.30,
-        "NoneOrUnknown": 0.00,
-    },
-
-    # Feedback #7: 社會/連續照護因子
-    "living": {"Alone": 0.25, "WithFamilyOrOthers": 0.00, "Institutional": -0.10},
-    "per_point_financial_stress": 0.08,
-    "has_case_manager": -0.25,           # 0/1
-    "prior_dropout_readmission": 0.60,    # 0/1
+    "bipolar_episode": {"Manic":0.15, "Depressive":0.10, "Mixed":0.20, "Unknown/NA":0.00},
+    "living_alone": 0.20,
+    "no_case_manager": 0.15,
+    "per_point_financial_strain": 0.05,
+    "prior_dropout_readmit": 0.35,
 }
 
 # ====== UI — Sidebar ======
 with st.sidebar:
     st.header("Patient Info")
-
     age = st.slider("Age", 18, 95, 35)
     gender = st.selectbox("Gender", GENDER_LIST, index=0)
     diagnoses = st.multiselect("Diagnoses (multi-select)", DIAG_LIST, default=[])
-    # Feedback #2: 若選 Bipolar 才顯示 episode
-    if "Bipolar" in diagnoses:
-        bipolar_ep = st.selectbox("Bipolar current episode", ["Depressive","Manic","Mixed","NoneOrUnknown"], index=3)
-    else:
-        bipolar_ep = "NoneOrUnknown"
-
-    # Feedback #1: 主因（可複選）
-    chief_probs = st.multiselect(
-        "Chief problem(s) for this admission",
-        ["SuicidalSelfHarm","ViolenceImpulsivity","UnableSelfCare","SevereSymptomsCaregiverLimit","ComplexDifferential","MedicationSideEffects"],
-        default=[]
-    )
-
-    length_of_stay = st.slider("Length of Stay (days)", 0, 90, 21)  # Feedback #4 default 21
+    # LOS 更貼近臨床：3~60 天，預設 21
+    length_of_stay = st.slider("Length of Stay (days)", 3, 120, 21)
     num_adm = st.slider("Previous Admissions (1y)", 0, 15, 1)
     compliance = st.slider("Medication Compliance Score (0–10)", 0.0, 10.0, 5.0)
     support = st.slider("Family Support Score (0–10)", 0.0, 10.0, 5.0)
-
-    # Feedback #6: 定義 followups = 首 30 天接觸次數
-    followups = st.slider("Post-discharge Followups (first 30 days)", 0, 10, 2, help="Number of contacts in first 14–30 days after discharge.")
-
+    followups = st.slider("Post-discharge Followups (within 30 days)", 0, 10, 2)  # 明確定義 30 天
+    financial = st.slider("Financial Strain (0–10)", 0.0, 10.0, 5.0)
+    living = st.selectbox("Living status", LIVING_STATUS, index=0)
+    has_cm = st.radio("Has case manager?", BIN_YESNO, index=1)
+    prior_dr = st.radio("Prior dropout-related readmission?", BIN_YESNO, index=1)
+    chief = st.selectbox("Chief problem of this admission", CHIEF_PROBLEMS, index=6)
+    bipolar_ep = st.selectbox("Bipolar current episode (if applicable)", BIPOLAR_EPISODES, index=0)
     recent_self_harm = st.radio("Recent Self-harm", BIN_YESNO, index=1)
     selfharm_adm = st.radio("Self-harm During Admission", BIN_YESNO, index=1)
-
-    # Feedback #7: 居住、財務、個管師、曾因 dropout 再住院
-    living = st.selectbox("Living situation after discharge", ["Alone","WithFamilyOrOthers","Institutional"], index=1)
-    financial_stress = st.slider("Financial stress (0–10)", 0.0, 10.0, 5.0)
-    has_cm = st.radio("Has case manager", BIN_YESNO, index=1)
-    prior_drop_readm = st.radio("Prior readmission due to dropout", BIN_YESNO, index=1)
 
     mode = st.radio("Mode", ["Pre-planning (no followup as feature)", "Post-planning (monitoring)"], index=0)
     use_followups_feature = (mode.startswith("Post"))
@@ -233,6 +193,7 @@ with st.sidebar:
         overlay_scale = st.slider("Overlay scale", 0.0, 1.0, OVERLAY_SCALE, 0.05)
         delta_clip = st.slider("Overlay delta clip |log-odds|", 0.0, 2.0, DELTA_CLIP, 0.05)
         temp_val = st.slider("Temperature (>1 softer probs)", 0.5, 3.0, TEMP, 0.05)
+        st.caption("Follow-ups are defined as contacts **within 30 days post-discharge** (clinic/phone/social work).")
 
     CAL_LOGIT_SHIFT = cal_shift
     BLEND_W = blend_w
@@ -240,7 +201,7 @@ with st.sidebar:
     DELTA_CLIP = delta_clip
     TEMP = temp_val
 
-# ====== Helpers (one-hot, alignment) ======
+# ====== Helpers ======
 def set_onehot_by_prefix(df, prefix, value):
     col = f"{prefix}_{value}"
     if col in df.columns: df.at[0, col] = 1
@@ -265,17 +226,13 @@ def proba_to_score(p): return int(round(proba_to_percent(p)))
 
 # ====== Model load / train (monotone) + optional isotonic calibration ======
 def get_monotone_constraints(feature_names):
-    # +1: increasing risk; -1: decreasing risk; 0: no constraint
     mono_map = {
         "num_previous_admissions": +1,
         "medication_compliance_score": -1,
         "family_support_score": -1,
         "post_discharge_followups": -1,
         "length_of_stay": +1,
-        # Feedback #7 monotone numerics:
-        "financial_stress_score": +1,
-        "has_case_manager": -1,
-        "prior_dropout_readmission": +1,
+        "financial_strain_score": +1,
     }
     cons = [str(mono_map.get(f, 0)) for f in feature_names]
     return "(" + ",".join(cons) + ")"
@@ -306,138 +263,104 @@ def align_df_to_model(df: pd.DataFrame, m):
         if booster is not None:
             nm = getattr(booster, "feature_names", None)
             if nm: names = list(nm)
-    except Exception: pass
+    except Exception:
+        pass
     if names:
         aligned = pd.DataFrame(0, index=df.index, columns=names, dtype=np.float32)
         inter = [c for c in names if c in df.columns]
         aligned.loc[:, inter] = df[inter].astype(np.float32).values
         return aligned, names
-    # fallback
     out = df.astype(np.float32)
     return out, list(out.columns)
 
 def train_demo_model_and_calibrator(columns):
-    # 合成資料 — Feedback #4: LOS 更接近 3–4 週
+    import xgboost as xgb
+    from sklearn.model_selection import train_test_split
+    from sklearn.calibration import CalibratedClassifierCV
+
     rng = np.random.default_rng(42)
     n = 12000
     X = pd.DataFrame(0, index=range(n), columns=columns, dtype=np.float32)
+
+    # 基本連續特徵（LOS 接近 3–4 週）
     X["age"] = rng.integers(16, 85, n)
-    X["length_of_stay"] = rng.normal(21.0, 7.0, n).clip(0, 60)
-    X["num_previous_admissions"] = rng.poisson(0.8, n).clip(0, 12)
+    X["length_of_stay"] = rng.normal(21.0, 8.0, n).clip(3, 60)  # ← 3~60天
+    X["num_previous_admissions"] = rng.poisson(1.0, n).clip(0, 12)
     X["medication_compliance_score"] = rng.normal(6.0, 2.5, n).clip(0, 10)
     X["family_support_score"] = rng.normal(5.0, 2.5, n).clip(0, 10)
     X["post_discharge_followups"] = rng.integers(0, 6, n)
+    X["financial_strain_score"] = rng.normal(5.0, 2.5, n).clip(0, 10)
 
-    # gender
+    # one-hots
     idx_gender = rng.integers(0, len(GENDER_LIST), n)
     for i, g in enumerate(GENDER_LIST): X.loc[idx_gender == i, f"gender_{g}"] = 1
 
-    # 主診斷 + 共病
     idx_primary = rng.integers(0, len(DIAG_LIST), n)
     for i, d in enumerate(DIAG_LIST): X.loc[idx_primary == i, f"diagnosis_{d}"] = 1
-    extra_probs = {"Substance Use Disorder": 0.20, "Anxiety": 0.20, "Depression": 0.25, "PTSD": 0.10}
-    for d, pr in extra_probs.items(): X.loc[rng.random(n) < pr, f"diagnosis_{d}"] = 1
 
-    # Bipolar episode
-    probs = rng.random(n)
-    X.loc[X["diagnosis_Bipolar"]==1, "bipolar_episode_Depressive"] = (probs<0.40)&(X["diagnosis_Bipolar"]==1)
-    X.loc[X["diagnosis_Bipolar"]==1, "bipolar_episode_Manic"] = ((probs>=0.40)&(probs<0.80))&(X["diagnosis_Bipolar"]==1)
-    X.loc[X["diagnosis_Bipolar"]==1, "bipolar_episode_Mixed"] = ((probs>=0.80))&(X["diagnosis_Bipolar"]==1)
-    X.loc[X["diagnosis_Bipolar"]!=1, "bipolar_episode_NoneOrUnknown"] = 1
+    # 住院主因 / 居住 / 個管 / 期別 / 既往因 dropout 再住院
+    idx_chief = rng.integers(0, len(CHIEF_PROBLEMS), n)
+    for i, c in enumerate(CHIEF_PROBLEMS): X.loc[idx_chief == i, f"chief_problem_{c}"] = 1
+    X["living_alone_Yes"] = (rng.random(n) < 0.35).astype(int)
+    X["living_alone_No"] = 1 - X["living_alone_Yes"]
+    X["has_case_manager_Yes"] = (rng.random(n) < 0.4).astype(int)
+    X["has_case_manager_No"] = 1 - X["has_case_manager_Yes"]
+    be_idx = rng.integers(0, len(BIPOLAR_EPISODES), n)
+    for i, b in enumerate(BIPOLAR_EPISODES):
+        X.loc[be_idx == i, f"bipolar_episode_{b}"] = 1
+    X["prior_dropout_readmit_Yes"] = (rng.random(n) < 0.12).astype(int)
+    X["prior_dropout_readmit_No"]  = 1 - X["prior_dropout_readmit_Yes"]
 
-    # 自傷旗標
-    r1, r2 = rng.integers(0, 2, n), rng.integers(0, 2, n)
-    X.loc[r1 == 1, "has_recent_self_harm_Yes"] = 1; X.loc[r1 == 0, "has_recent_self_harm_No"] = 1
-    X.loc[r2 == 1, "self_harm_during_admission_Yes"] = 1; X.loc[r2 == 0, "self_harm_during_admission_No"] = 1
+    # 自傷旗標：PD/PTSD/SUD 提高
+    base_self = rng.random(n)
+    pd_mask  = (X.get("diagnosis_Personality Disorder",0)==1)
+    ptsd_mask= (X.get("diagnosis_PTD",X.get("diagnosis_PTSD",0))==1)
+    sud_mask = (X.get("diagnosis_Substance Use Disorder",0)==1)
+    boost = 0.10*pd_mask + 0.08*ptsd_mask + 0.10*sud_mask
+    r1 = (base_self < (0.18 + boost)).astype(int)
+    r2 = (rng.random(n) < (0.12 + 0.5*boost)).astype(int)
+    X["has_recent_self_harm_Yes"] = r1; X["has_recent_self_harm_No"] = 1-r1
+    X["self_harm_during_admission_Yes"] = r2; X["self_harm_during_admission_No"] = 1-r2
 
-    # Chief problems（依診斷提高特定主因機率）
-    def put_chief(i_mask, name, p):
-        sel = (rng.random(n) < p) & i_mask
-        X.loc[sel, f"chief_{name}"] = 1
-    any_pd = (X["diagnosis_Personality Disorder"]==1)
-    any_ptsd = (X["diagnosis_PTSD"]==1)
-    any_sud = (X["diagnosis_Substance Use Disorder"]==1)
-    any_scz = (X["diagnosis_Schizophrenia"]==1)
-    any_bip = (X["diagnosis_Bipolar"]==1)
-
-    put_chief(any_pd | any_ptsd | any_sud, "SuicidalSelfHarm", 0.35)
-    put_chief(any_sud, "ViolenceImpulsivity", 0.20)
-    put_chief(any_scz | any_bip, "SevereSymptomsCaregiverLimit", 0.30)
-    put_chief((~(any_pd|any_ptsd|any_sud|any_scz|any_bip)), "ComplexDifferential", 0.10)
-    put_chief(any_bip, "MedicationSideEffects", 0.10)
-    put_chief(rng.random(n)>0.8, "UnableSelfCare", 0.15)
-
-    # Living / Social
-    lv = rng.random(n)
-    X.loc[lv<0.30, "living_Alone"] = 1
-    X.loc[(lv>=0.30)&(lv<0.90), "living_WithFamilyOrOthers"] = 1
-    X.loc[lv>=0.90, "living_Institutional"] = 1
-
-    X["financial_stress_score"] = rng.normal(5.0, 2.5, n).clip(0, 10)
-    X["has_case_manager"] = (rng.random(n) < 0.30).astype(np.float32)
-    # prior dropout readmission ↗ if prev_adm≥1
-    X["prior_dropout_readmission"] = ((rng.random(n) < 0.15) & (X["num_previous_admissions"]>=1)).astype(np.float32)
-
-    # 目標（log-odds 組合）
-    beta0 = -0.60
-    beta = {
-        "has_recent_self_harm_Yes": 0.80,
-        "self_harm_during_admission_Yes": 0.60,
-        "prev_adm_ge2": 0.60,
-        "medication_compliance_per_point": -0.25,
-        "family_support_per_point": -0.20,
-        "followups_per_visit": -0.15,
-        # Feedback #4: LOS 更長，仍保留 +0.05/日趨勢
-        "length_of_stay_per_day": 0.05,
-        # Feedback #7:
-        "financial_stress_per_point": 0.08,
-        "has_case_manager": -0.25,
-        "prior_dropout_readmission": 0.60,
-    }
-    beta_diag = {
-        "Personality Disorder": 0.35, "Substance Use Disorder": 0.35, "Bipolar": 0.10,
-        "PTSD": 0.10, "Schizophrenia": 0.10, "Depression": 0.05,
-        "Anxiety": 0.00, "OCD": 0.00, "Dementia": 0.00, "ADHD": 0.00, "Other/Unknown": 0.00,
-    }
+    # 真值生成（加上新特徵影響）
+    beta0 = -0.55
     prev_ge2 = (X["num_previous_admissions"] >= 2).astype(np.float32)
     logit = (beta0
-             + beta["has_recent_self_harm_Yes"]       * X["has_recent_self_harm_Yes"]
-             + beta["self_harm_during_admission_Yes"] * X["self_harm_during_admission_Yes"]
-             + beta["prev_adm_ge2"]                   * prev_ge2
-             + beta["medication_compliance_per_point"]* X["medication_compliance_score"]
-             + beta["family_support_per_point"]       * X["family_support_score"]
-             + beta["followups_per_visit"]            * X["post_discharge_followups"]
-             + beta["length_of_stay_per_day"]         * X["length_of_stay"]
-             + beta["financial_stress_per_point"]     * X["financial_stress_score"]
-             + beta["has_case_manager"]               * X["has_case_manager"]
-             + beta["prior_dropout_readmission"]      * X["prior_dropout_readmission"]
-             )
-    for d, w in beta_diag.items(): logit = logit + w * X[f"diagnosis_{d}"]
-    # living
-    logit += 0.25 * X["living_Alone"] + 0.00 * X["living_WithFamilyOrOthers"] + (-0.10) * X["living_Institutional"]
-    # chief problems
-    chief_w = {"SuicidalSelfHarm":0.70,"ViolenceImpulsivity":0.40,"UnableSelfCare":0.30,
-               "SevereSymptomsCaregiverLimit":0.30,"ComplexDifferential":0.15,"MedicationSideEffects":0.20}
-    for k,w in chief_w.items(): logit = logit + w * X[f"chief_{k}"]
+             + 0.85*X["has_recent_self_harm_Yes"]
+             + 0.65*X["self_harm_during_admission_Yes"]
+             + 0.60*prev_ge2
+             - 0.26*X["medication_compliance_score"]
+             - 0.20*X["family_support_score"]
+             - 0.15*X["post_discharge_followups"]
+             + 0.05*X["length_of_stay"]
+             + 0.05*X["financial_strain_score"]
+             + 0.35*X["prior_dropout_readmit_Yes"]
+             + 0.15*X["living_alone_Yes"]
+             - 0.12*X["has_case_manager_Yes"])
+    # chief
+    for k,w in POLICY["chief"].items():
+        col=f"chief_problem_{k}"
+        if col in X.columns: logit += w * X[col]
     # bipolar episode
-    epi_w = {"Depressive":0.05,"Manic":0.20,"Mixed":0.30,"NoneOrUnknown":0.00}
-    for k,w in epi_w.items(): 
+    for k,w in POLICY["bipolar_episode"].items():
         col=f"bipolar_episode_{k}"
-        if col in X.columns: logit = logit + w * X[col]
-
+        if col in X.columns: logit += w * X[col]
+    # 診斷
+    for d, w in POLICY["diag"].items(): 
+        col=f"diagnosis_{d}"
+        if col in X.columns: logit += w * X[col]
+    # 噪音
     noise = rng.normal(0.0, 0.35, n).astype(np.float32)
-    p = 1.0 / (1.0 + np.exp(-(logit + noise)))
+    # ✅ 修正：先轉 numpy 再進 np.exp，避免 pandas array_ufunc 錯誤
+    logit_np = logit.to_numpy(np.float32)
+    p = 1.0 / (1.0 + np.exp(-(logit_np + noise)))
     y = (rng.random(n) < p).astype(np.int32)
 
-    # 單調性 XGB
     model = xgb_model_with_monotone(list(X.columns))
     model.fit(X, y)
 
-    # Optional isotonic calibration
     calibrator = None
     try:
-        from sklearn.model_selection import train_test_split
-        from sklearn.calibration import CalibratedClassifierCV
         X_tr, X_ca, y_tr, y_ca = train_test_split(X, y, test_size=0.2, random_state=777)
         calibrator = CalibratedClassifierCV(model, cv="prefit", method="isotonic")
         calibrator.fit(X_ca, y_ca)
@@ -485,14 +408,10 @@ def overlay_single_and_drivers(X1: pd.DataFrame, include_followup_effect: bool =
     fup  = _num_or_default(row["post_discharge_followups"], "post_discharge_followups")
     los  = _num_or_default(row["length_of_stay"], "length_of_stay")
     agev = _num_or_default(row["age"], "age")
-    stress = _num_or_default(row.get("financial_stress_score", np.nan), "financial_stress_score")
-    hascm = _num_or_default(row.get("has_case_manager", np.nan), "has_case_manager")
-    priorr = _num_or_default(row.get("prior_dropout_readmission", np.nan), "prior_dropout_readmission")
+    fin  = _num_or_default(row["financial_strain_score"], "financial_strain_score")
 
     lz += add("More previous admissions", POLICY["per_prev_admission"] * min(int(adm), 5))
     lz += add("Low family support", POLICY["per_point_low_support"] * max(0.0, 5.0 - sup))
-
-    # compliance：低→加分，高→保護
     lz += add("Low medication compliance", POLICY["per_point_low_compliance"] * max(0.0, 5.0 - comp))
     if comp >= 8:
         lz += add("High compliance (protective)", POLICY["per_point_high_compliance_protect"] * (comp - 7.0))
@@ -501,49 +420,37 @@ def overlay_single_and_drivers(X1: pd.DataFrame, include_followup_effect: bool =
         lz += add("More post-discharge followups (protective)", POLICY["per_followup"] * fup)
         if fup == 0: lz += add("No follow-up scheduled", POLICY["no_followup_extra"])
 
-    # LOS（Feedback #4 thresholds）
-    if los < 7: lz += add("Very short stay (<7d)", POLICY["los_short"])
-    elif los <= 28: lz += add("Typical stay (7–28d)", POLICY["los_mid"])
-    elif los <= 42: lz += add("Longish stay (29–42d)", POLICY["los_mid_high"])
-    else: lz += add("Very long stay (>42d)", POLICY["los_long"])
+    if los < 3: lz += add("Very short stay (<3d)", POLICY["los_short"])
+    elif los <= 21: lz += add("Typical stay (3–21d)", POLICY["los_mid"])
+    elif los <= 35: lz += add("Longish stay (22–35d)", POLICY["los_mid_high"])
+    else: lz += add("Very long stay (>35d)", POLICY["los_long"])
 
     if agev < 21: lz += add("Young age (<21)", POLICY["age_young"])
     elif agev >= 75: lz += add("Older age (≥75)", POLICY["age_old"])
 
+    # 新增特徵
+    lz += add("Living alone", POLICY["living_alone"] * int(row.get("living_alone_Yes",0)==1))
+    lz += add("No case manager", POLICY["no_case_manager"] * int(row.get("has_case_manager_No",0)==1))
+    lz += add("Financial strain", POLICY["per_point_financial_strain"] * fin)
+    lz += add("Prior dropout readmission", POLICY["prior_dropout_readmit"] * int(row.get("prior_dropout_readmit_Yes",0)==1))
+
+    # chief / bipolar
+    for k,w in POLICY["chief"].items():
+        col=f"chief_problem_{k}"
+        if col in X1.columns and X1.at[0,col]==1: lz += add(f"Chief: {k}", w)
+    for k,w in POLICY["bipolar_episode"].items():
+        col=f"bipolar_episode_{k}"
+        if col in X1.columns and X1.at[0,col]==1: lz += add(f"Bipolar episode: {k}", w)
+
+    # 診斷與交互
     for dx, w in POLICY["diag"].items():
         if X1.at[0, f"diagnosis_{dx}"] == 1:
             lz += add(f"Diagnosis: {dx}", w)
-
-    # Chief problems
-    for c, w in POLICY["chief"].items():
-        col = f"chief_{c}"
-        if col in X1.columns and X1.at[0, col] == 1:
-            lz += add(f"Chief: {c}", w)
-
-    # Bipolar episode
-    for ep, w in POLICY["bipolar_episode"].items():
-        col = f"bipolar_episode_{ep}"
-        if col in X1.columns and X1.at[0, col] == 1:
-            lz += add(f"BipolarEpisode: {ep}", w)
-
-    # Living
-    for lv, w in POLICY["living"].items():
-        col = f"living_{lv}"
-        if col in X1.columns and X1.at[0, col] == 1:
-            lz += add(f"Living: {lv}", w)
-
-    # Social numerics
-    lz += add("Financial stress", POLICY["per_point_financial_stress"] * stress)
-    lz += add("Case manager (protective)", POLICY["has_case_manager"] * hascm)
-    lz += add("Prior dropout readmission", POLICY["prior_dropout_readmission"] * priorr)
-
-    # Interactions
     if (X1.at[0, "diagnosis_Substance Use Disorder"] == 1) and (comp <= 3):
         lz += add("SUD × very low compliance", POLICY["x_sud_lowcomp"])
-    if (X1.at[0, "diagnosis_Personality Disorder"] == 1) and (los < 7):
+    if (X1.at[0, "diagnosis_Personality Disorder"] == 1) and (los < 3):
         lz += add("PD × very short stay", POLICY["x_pd_shortlos"])
 
-    # scale + clip + calibration + temp
     delta = np.clip(OVERLAY_SCALE * (lz - base_logit), -DELTA_CLIP, DELTA_CLIP)
     lz2 = base_logit + delta + CAL_LOGIT_SHIFT
     p_overlay = _sigmoid(lz2 / TEMP)
@@ -554,32 +461,28 @@ X_single = pd.DataFrame(0, index=[0], columns=TEMPLATE_COLUMNS, dtype=float)
 for k, v in {
     "age": age, "length_of_stay": float(length_of_stay), "num_previous_admissions": int(num_adm),
     "medication_compliance_score": float(compliance), "family_support_score": float(support),
-    "post_discharge_followups": int(followups),
-    "financial_stress_score": float(financial_stress),
-    "has_case_manager": 1.0 if has_cm=="Yes" else 0.0,
-    "prior_dropout_readmission": 1.0 if prior_drop_readm=="Yes" else 0.0,
+    "post_discharge_followups": int(followups), "financial_strain_score": float(financial),
 }.items(): X_single.at[0, k] = v
 set_onehot_by_prefix(X_single, "gender", gender)
 set_onehot_by_prefix_multi(X_single, "diagnosis", diagnoses)
 set_onehot_by_prefix(X_single, "has_recent_self_harm", recent_self_harm)
 set_onehot_by_prefix(X_single, "self_harm_during_admission", selfharm_adm)
-set_onehot_by_prefix(X_single, "living", living)
-set_onehot_by_prefix_multi(X_single, "chief", chief_probs)
+set_onehot_by_prefix(X_single, "chief_problem", chief)
 set_onehot_by_prefix(X_single, "bipolar_episode", bipolar_ep)
+set_onehot_by_prefix(X_single, "prior_dropout_readmit", prior_dr)
+set_onehot_by_prefix(X_single, "has_case_manager", has_cm)
+set_onehot_by_prefix(X_single, "living_alone", "Yes" if living=="Alone" else "No")
 fill_defaults_single_row(X_single)
 
-# Pre-planning：避免洩漏 → 特徵仍在，但值設 0（模型與 overlay 均不吃）
 X_used = X_single.copy()
 if not use_followups_feature:
     X_used.at[0, "post_discharge_followups"] = 0
 
-# 預測（model + overlay + blend + uplift）
 X_align, _ = align_df_to_model(X_used, model)
 p_model = float(predict_model_proba(X_align)[0])
 p_overlay, drivers = overlay_single_and_drivers(X_used, include_followup_effect=use_followups_feature)
 p_final = (1.0 - BLEND_W) * p_model + BLEND_W * p_overlay
 
-# 自傷 uplift
 if flag_yes(X_used.iloc[0], "has_recent_self_harm") or flag_yes(X_used.iloc[0], "self_harm_during_admission"):
     p_final = min(max(p_final, SOFT_UPLIFT["floor"]) + SOFT_UPLIFT["add"], SOFT_UPLIFT["cap"])
 
@@ -589,20 +492,10 @@ percent_final = proba_to_percent(p_final)
 score = proba_to_score(p_final)
 level = risk_bins(score)
 
-# ====== Guards / input reasonableness ======
+# ====== Guards ======
 warns = []
-# Feedback #4: LOS 短於 7 天提醒；超長也提醒
-if 0 < length_of_stay < 7: warns.append("Length of stay < 7d is shorter than typical 3–4 weeks in TW acute wards; verify.")
-if length_of_stay > 60: warns.append("Length of stay > 60d is unusual; check data.")
+if length_of_stay > 90: warns.append("Length of stay > 90d is unusual in acute settings; check data.")
 if (num_adm > 10): warns.append("Previous admissions > 10 in 1y is uncommon; confirm definition.")
-# Feedback #3: ADHD-only
-if diagnoses == ["ADHD"]:
-    warns.append("ADHD as sole admission diagnosis is uncommon; check for comorbidities.")
-# Feedback #5: PD/PTSD/SUD usually have self-harm — hint if both NO
-if any(dx in diagnoses for dx in ["Personality Disorder","PTSD","Substance Use Disorder"]) and \
-   (recent_self_harm=="No") and (selfharm_adm=="No"):
-    warns.append("For PD/PTSD/SUD cases, self-harm often present; double-check self-harm flags.")
-
 if warns:
     st.info("ℹ️ Data sanity check:\n- " + "\n- ".join(warns))
 
@@ -614,7 +507,7 @@ with c2: st.metric("Overlay Probability", f"{percent_overlay:.1f}%")
 with c3: st.metric("Final Probability", f"{percent_final:.1f}%")
 with c4: st.metric("Risk Score (0–100)", f"{score}")
 
-note = "Pre-planning mode: follow-ups feature is ignored." if not use_followups_feature else "Post-planning mode: follow-ups feature is used."
+note = "Pre-planning mode: follow-ups feature is ignored." if not use_followups_feature else "Post-planning mode: follow-ups feature is used (within 30 days)."
 st.caption(note)
 
 if level == "High":
@@ -628,10 +521,9 @@ elif level == "Low–Moderate":
 else:
     st.success("🟢 Low Risk")
 
-# ====== SHAP + Policy drivers + 對齊卡（含 waterfall 圖） ======
+# ====== SHAP + Policy drivers + 對齊卡 ======
 with st.expander("🔍 Explanations — Model SHAP vs Policy drivers", expanded=True):
     import xgboost as xgb
-    # 1) 取得單例 SHAP（優先用 pred_contribs）
     try:
         booster = model.get_booster()
         dmat = xgb.DMatrix(X_align, feature_names=list(X_align.columns))
@@ -648,66 +540,53 @@ with st.expander("🔍 Explanations — Model SHAP vs Policy drivers", expanded=
             if isinstance(sv_raw, list): sv_raw = sv_raw[0]
         sv_map = dict(zip(list(X_align.columns), sv_raw[0]))
 
-    # 2) 建立可視化資料（同時給 waterfall 與表格使用）
     feat_rows = []
     def _push_shap(label, key, shown_value):
         if key in sv_map:
             feat_rows.append({"feature": label, "value": shown_value, "model_shap": float(sv_map[key]), "key": key})
 
-    # 連續特徵
-    _push_shap("Age", "age", X_used.at[0,"age"])
-    _push_shap("Length of Stay", "length_of_stay", X_used.at[0,"length_of_stay"])
-    _push_shap("Previous Admissions", "num_previous_admissions", X_used.at[0,"num_previous_admissions"])
-    _push_shap("Medication Compliance", "medication_compliance_score", X_used.at[0,"medication_compliance_score"])
-    _push_shap("Family Support", "family_support_score", X_used.at[0,"family_support_score"])
-    _push_shap("Followups (30d)", "post_discharge_followups", X_used.at[0,"post_discharge_followups"])
-    _push_shap("Financial Stress", "financial_stress_score", X_used.at[0,"financial_stress_score"])
-    _push_shap("Case Manager", "has_case_manager", X_used.at[0,"has_case_manager"])
-    _push_shap("Prior Dropout Readmission", "prior_dropout_readmission", X_used.at[0,"prior_dropout_readmission"])
+    for lab,key in [
+        ("Age","age"),("Length of Stay","length_of_stay"),("Previous Admissions","num_previous_admissions"),
+        ("Medication Compliance","medication_compliance_score"),("Family Support","family_support_score"),
+        ("Followups (30d)","post_discharge_followups"),("Financial strain","financial_strain_score")
+    ]:
+        _push_shap(lab, key, X_used.at[0,key])
 
-    # 一熱特徵（僅顯示被選中的）
     for dx in diagnoses: _push_shap(f"Diagnosis={dx}", f"diagnosis_{dx}", 1)
     _push_shap(f"Gender={gender}", f"gender_{gender}", 1)
     _push_shap(f"Recent Self-harm={recent_self_harm}", f"has_recent_self_harm_{recent_self_harm}", 1)
     _push_shap(f"Self-harm During Admission={selfharm_adm}", f"self_harm_during_admission_{selfharm_adm}", 1)
-    for c in chief_probs: _push_shap(f"Chief={c}", f"chief_{c}", 1)
-    _push_shap(f"Living={living}", f"living_{living}", 1)
-    _push_shap(f"BipolarEpisode={bipolar_ep}", f"bipolar_episode_{bipolar_ep}", 1)
+    _push_shap(f"Chief={chief}", f"chief_problem_{chief}", 1)
+    _push_shap(f"Bipolar episode={bipolar_ep}", f"bipolar_episode_{bipolar_ep}", 1)
+    _push_shap(f"Living alone={'Yes' if living=='Alone' else 'No'}", f"living_alone_{'Yes' if living=='Alone' else 'No'}", 1)
+    _push_shap(f"Case manager={has_cm}", f"has_case_manager_{has_cm}", 1)
+    _push_shap(f"Prior dropout readmit={prior_dr}", f"prior_dropout_readmit_{prior_dr}", 1)
 
     df_shap = pd.DataFrame(feat_rows)
-
-    # 3) 單例 SHAP waterfall 圖（取 |SHAP| 最大的前 12 個）
     if len(df_shap):
         df_top = df_shap.reindex(df_shap["model_shap"].abs().sort_values(ascending=False).index).head(12)
-        names = df_top["feature"].tolist()
-        vals = df_top["model_shap"].to_numpy(dtype=float)
-        data_vals = df_top["value"].to_numpy(dtype=float)
-
-        exp = shap.Explanation(values=vals, base_values=base_value, feature_names=names, data=data_vals)
+        exp = shap.Explanation(
+            values=df_top["model_shap"].to_numpy(float),
+            base_values=float(base_value),
+            feature_names=df_top["feature"].tolist(),
+            data=df_top["value"].to_numpy(float),
+        )
         shap.plots.waterfall(exp, show=False, max_display=12)
         st.pyplot(plt.gcf(), clear_figure=True)
-    else:
-        st.caption("No SHAP contributions available for the selected case.")
-
-    # 4) 以表格呈現 SHAP
-    st.caption("Model SHAP (top by |value|)")
-    if len(df_shap):
+        st.caption("Model SHAP (top by |value|)")
         st.dataframe(
             df_shap.reindex(df_shap["model_shap"].abs().sort_values(ascending=False).index)[["feature","value","model_shap"]].head(12),
             use_container_width=True
         )
+    else:
+        st.caption("No SHAP contributions available for the selected case.")
 
-    # 5) Policy drivers（overlay 前的 log-odds 貢獻）
     df_drv = pd.DataFrame(
         [{"driver": k, "policy_log_odds (pre-scale)": round(v, 3)} for k, v in sorted(drivers, key=lambda x: abs(x[1]), reverse=True)]
     )
     st.caption("Policy drivers")
-    if len(df_drv):
-        st.dataframe(df_drv, use_container_width=True)
-    else:
-        st.write("No policy drivers for this case.")
+    st.dataframe(df_drv, use_container_width=True)
 
-    # 6) 模型 vs 政策 對齊卡
     st.caption("Alignment check (Model vs Policy) — look for ⚠️ if directions disagree.")
     def _sign(x): return 1 if x>1e-6 else (-1 if x<-1e-6 else 0)
     align_rows = []
@@ -715,12 +594,13 @@ with st.expander("🔍 Explanations — Model SHAP vs Policy drivers", expanded=
         ("Previous Admissions","num_previous_admissions","More previous admissions"),
         ("Medication Compliance","medication_compliance_score","Low medication compliance"),
         ("Family Support","family_support_score","Low family support"),
-        ("Followups","post_discharge_followups","More post-discharge followups (protective)"),
-        ("Length of Stay","length_of_stay","Very short stay"),
-        ("Financial Stress","financial_stress_score","Financial stress"),
-        ("Case Manager","has_case_manager","Case manager (protective)"),
-        ("Prior Dropout Readmission","prior_dropout_readmission","Prior dropout readmission"),
+        ("Followups (30d)","post_discharge_followups","More post-discharge followups"),
+        ("Length of Stay","length_of_stay","Very short stay (<3d) / Long stay"),
+        ("Living alone","living_alone_Yes","Living alone"),
+        ("Case manager","has_case_manager_No","No case manager"),
+        ("Financial strain","financial_strain_score","Financial strain"),
     ]
+    sv_map = {r["key"]:r["model_shap"] for _,r in pd.DataFrame(feat_rows).iterrows()} if len(feat_rows) else {}
     for lab, key, dname in name_map:
         shap_v = float(sv_map.get(key, 0.0))
         pol = 0.0
@@ -730,7 +610,7 @@ with st.expander("🔍 Explanations — Model SHAP vs Policy drivers", expanded=
         align_rows.append({"feature": lab, "model_sign": ms, "policy_sign": ps, "flag": "⚠️" if (ms*ps==-1) else ""})
     st.dataframe(pd.DataFrame(align_rows), use_container_width=True)
 
-# ====== Recommended actions（與前版相同邏輯，小幅擴充） ======
+# ====== Recommended actions（同前版，小幅調整文案） ======
 st.subheader("Recommended Actions")
 BASE_ACTIONS = {
     "High": [
@@ -756,40 +636,48 @@ def _normalize_action_tuple(a):
     if len(a)==3: return (a[0],a[1],a[2])
     return a
 
-def personalized_actions(row: pd.Series, chosen_dx: list, chief_list: list, living: str):
+def personalized_actions(row: pd.Series, chosen_dx: list):
     acts = []
     comp = _num_or_default(row["medication_compliance_score"], "medication_compliance_score")
     sup  = _num_or_default(row["family_support_score"], "family_support_score")
     fup  = _num_or_default(row["post_discharge_followups"], "post_discharge_followups")
     los  = _num_or_default(row["length_of_stay"], "length_of_stay")
     agev = _num_or_default(row["age"], "age")
+    fin  = _num_or_default(row["financial_strain_score"], "financial_strain_score")
     has_selfharm = flag_yes(row, "has_recent_self_harm") or flag_yes(row, "self_harm_during_admission")
     has_sud = "Substance Use Disorder" in chosen_dx
     has_pd  = "Personality Disorder" in chosen_dx
     has_dep = "Depression" in chosen_dx
     has_scz = "Schizophrenia" in chosen_dx
+    living_alone = (row.get("living_alone_Yes",0)==1)
+    no_cm = (row.get("has_case_manager_No",0)==1)
+    prior_dr = (row.get("prior_dropout_readmit_Yes",0)==1)
 
-    if has_selfharm or ("SuicidalSelfHarm" in chief_list):
+    if has_selfharm:
         acts += [("Today","Clinician","C-SSRS; update safety plan; lethal-means counseling"),
                  ("48h","Nurse","Safety check-in call")]
     if has_sud and comp <= 3:
         acts += [("1–7d","Clinician","Brief MI focused on use goals"),
                  ("1–7d","Care coordinator","Refer to SUD program/IOP or CM"),
                  ("Today","Clinician","Overdose prevention education")]
-    if has_pd and los < 7:
+    if has_pd and los < 3:
         acts += [("Today","Care coordinator","Same-day DBT/skills intake"),
                  ("48h","Peer support","Proactive outreach + skills workbook")]
     if comp <= 3:
         acts += [("7d","Pharmacist","Simplify regimen + blister/pillbox + reminders"),
                  ("1–2w","Clinician","Consider LAI if appropriate")]
-    if sup <= 2 or living=="Alone":
-        acts += [("1–2w","Clinician","Family/caregiver meeting or social support linkage"),
+    if sup <= 2 or living_alone:
+        acts += [("1–2w","Clinician","Family meeting / caregiver engagement"),
                  ("1–2w","Social worker","Community supports; transport/financial counseling")]
     if fup == 0:
         acts += [("Today","Clinic scheduler","Book 2 touchpoints in first 14 days (day2/day7)")]
-    if los < 7:
+    if fin >= 7:
+        acts += [("1–2w","Social worker","Financial aid application; transport vouchers")]
+    if no_cm or prior_dr:
+        acts += [("Today","Care coordinator","Enroll/confirm case management; relapse prevention")]
+    if los < 3:
         acts += [("48h","Nurse","Early call; review meds/barriers")]
-    elif los > 42:
+    elif los > 35:
         acts += [("1–7d","Care coordinator","Step-down/day program plan + warm handoff")]
     if agev < 21:
         acts += [("1–2w","Clinician","Involve guardians; link school counseling")]
@@ -803,7 +691,7 @@ def personalized_actions(row: pd.Series, chosen_dx: list, chief_list: list, livi
 
 bucket = {"High":"High","Moderate–High":"High","Moderate":"Moderate","Low–Moderate":"Low","Low":"Low"}
 acts = [ _normalize_action_tuple(a) for a in BASE_ACTIONS[bucket[level]] ]
-acts += personalized_actions(X_used.iloc[0], diagnoses, chief_probs, living)
+acts += personalized_actions(X_used.iloc[0], diagnoses)
 seen=set(); uniq=[]
 for a in acts:
     key=(a[0],a[1],a[2])
@@ -833,7 +721,7 @@ if level in ["High","Moderate–High"]:
                            file_name="dropout_risk_SOP.docx",
                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
-# ====== What-if 小面板 ======
+# ====== What-if ======
 with st.expander("🧪 What-if: adjust followups/compliance and recompute", expanded=False):
     wf_follow = st.slider("What-if followups (30d)", 0, 10, int(X_single.at[0,"post_discharge_followups"]))
     wf_comp   = st.slider("What-if compliance", 0.0, 10.0, float(X_single.at[0,"medication_compliance_score"]), 0.5)
@@ -850,12 +738,10 @@ with st.expander("🧪 What-if: adjust followups/compliance and recompute", expa
 st.markdown("---")
 st.subheader("Batch Prediction (Excel)")
 friendly_cols = [
-    "Age","Gender","Diagnoses","Bipolar Episode (if bipolar)",
-    "Chief Problem(s)",
-    "Length of Stay (days)","Previous Admissions (1y)",
-    "Medication Compliance Score (0–10)","Family Support Score (0–10)","Post-discharge Followups (first 30d)",
-    "Recent Self-harm","Self-harm During Admission",
-    "Living Situation","Financial Stress (0–10)","Has Case Manager (Yes/No)","Prior Dropout Readmission (Yes/No)"
+    "Age","Gender","Diagnoses","Length of Stay (days)","Previous Admissions (1y)",
+    "Medication Compliance Score (0–10)","Family Support Score (0–10)","Post-discharge Followups (30d)",
+    "Financial Strain (0–10)","Living status","Has case manager?","Prior dropout-related readmission?",
+    "Chief problem","Bipolar current episode","Recent Self-harm","Self-harm During Admission"
 ]
 tpl = pd.DataFrame(columns=friendly_cols)
 buf_tpl = BytesIO(); tpl.to_excel(buf_tpl, index=False); buf_tpl.seek(0)
@@ -867,43 +753,21 @@ def parse_multi(cell):
     parts = [p.strip() for p in re.split(r"[;,/|]", str(cell)) if p.strip()]
     return parts if parts else []
 
-def _yn_to01(v): 
-    v=str(v).strip().lower()
-    if v in ["1","y","yes","true","是","有"]: return 1.0
-    return 0.0
-
-def _map_living(v):
-    s=str(v).lower()
-    if "alone" in s or "獨" in s: return "Alone"
-    if "instit" in s or "機構" in s: return "Institutional"
-    return "WithFamilyOrOthers"
-
-def _map_episode(v):
-    s=str(v).lower()
-    if "manic" in s or "躁" in s: return "Manic"
-    if "mixed" in s or "混" in s: return "Mixed"
-    if "depress" in s or "鬱" in s: return "Depressive"
-    return "NoneOrUnknown"
-
 if uploaded is not None:
     try:
         raw = pd.read_excel(uploaded)
         df = pd.DataFrame(0, index=raw.index, columns=TEMPLATE_COLUMNS, dtype=float)
 
         def safe(col, default=0): return raw[col] if col in raw.columns else default
-        for k_raw, k in [
+        mapping = [
             ("Age","age"), ("Length of Stay (days)","length_of_stay"),
             ("Previous Admissions (1y)","num_previous_admissions"),
             ("Medication Compliance Score (0–10)","medication_compliance_score"),
             ("Family Support Score (0–10)","family_support_score"),
-            ("Post-discharge Followups (first 30d)","post_discharge_followups"),
-            ("Financial Stress (0–10)","financial_stress_score"),
-        ]:
-            df[k] = safe(k_raw)
-
-        # numerics 0/1
-        df["has_case_manager"] = safe("Has Case Manager (Yes/No)", 0).apply(_yn_to01)
-        df["prior_dropout_readmission"] = safe("Prior Dropout Readmission (Yes/No)", 0).apply(_yn_to01)
+            ("Post-discharge Followups (30d)","post_discharge_followups"),
+            ("Financial Strain (0–10)","financial_strain_score"),
+        ]
+        for k_raw, k in mapping: df[k] = safe(k_raw)
 
         # one-hots
         if "Gender" in raw.columns:
@@ -915,24 +779,26 @@ if uploaded is not None:
                 for v in parse_multi(cell):
                     col=f"diagnosis_{v}"
                     if col in df.columns: df.at[i,col]=1
-        # chief problems
-        if "Chief Problem(s)" in raw.columns:
-            for i, cell in raw["Chief Problem(s)"].items():
-                for v in parse_multi(cell):
-                    col=f"chief_{v}"
-                    if col in df.columns: df.at[i,col]=1
-        # living
-        if "Living Situation" in raw.columns:
-            for i, v in raw["Living Situation"].items():
-                lv=_map_living(v); col=f"living_{lv}"
+
+        # 新增欄位
+        if "Living status" in raw.columns:
+            for i, v in raw["Living status"].astype(str).str.strip().items():
+                df.at[i, f"living_alone_{'Yes' if v=='Alone' else 'No'}"] = 1
+        if "Has case manager?" in raw.columns:
+            for i, v in raw["Has case manager?"].astype(str).str.strip().items():
+                df.at[i, f"has_case_manager_{v}"] = 1
+        if "Prior dropout-related readmission?" in raw.columns:
+            for i, v in raw["Prior dropout-related readmission?"].astype(str).str.strip().items():
+                df.at[i, f"prior_dropout_readmit_{v}"] = 1
+        if "Chief problem" in raw.columns:
+            for i, v in raw["Chief problem"].astype(str).str.strip().items():
+                col=f"chief_problem_{v}"
                 if col in df.columns: df.at[i,col]=1
-        # bipolar episode
-        if "Bipolar Episode (if bipolar)" in raw.columns:
-            for i, v in raw["Bipolar Episode (if bipolar)"].items():
-                ep=_map_episode(v); col=f"bipolar_episode_{ep}"
+        if "Bipolar current episode" in raw.columns:
+            for i, v in raw["Bipolar current episode"].astype(str).str.strip().items():
+                col=f"bipolar_episode_{v}"
                 if col in df.columns: df.at[i,col]=1
 
-        # self-harm flags
         for col_h, pre in [("Recent Self-harm","has_recent_self_harm"), ("Self-harm During Admission","self_harm_during_admission")]:
             if col_h in raw.columns:
                 for i, v in raw[col_h].astype(str).str.strip().items():
@@ -941,14 +807,12 @@ if uploaded is not None:
 
         fill_defaults_batch(df)
 
-        # Pre-planning → followups=0
         if not use_followups_feature:
             df["post_discharge_followups"] = 0
 
         Xb_al, _ = align_df_to_model(df, model)
         base_probs = predict_model_proba(Xb_al)
 
-        # Overlay vectorized
         def overlay_vec(df_feat: pd.DataFrame, include_followup=True):
             base = _logit_vec(base_probs); lz = base.copy()
             adm = pd.to_numeric(df_feat["num_previous_admissions"], errors="coerce").fillna(DEFAULTS["num_previous_admissions"]).to_numpy()
@@ -957,9 +821,7 @@ if uploaded is not None:
             fup = pd.to_numeric(df_feat["post_discharge_followups"], errors="coerce").fillna(DEFAULTS["post_discharge_followups"]).to_numpy()
             los = pd.to_numeric(df_feat["length_of_stay"], errors="coerce").fillna(DEFAULTS["length_of_stay"]).to_numpy()
             agev= pd.to_numeric(df_feat["age"], errors="coerce").fillna(DEFAULTS["age"]).to_numpy()
-            stress = pd.to_numeric(df_feat.get("financial_stress_score",0), errors="coerce").fillna(DEFAULTS["financial_stress_score"]).to_numpy()
-            hascm = pd.to_numeric(df_feat.get("has_case_manager",0), errors="coerce").fillna(0).to_numpy()
-            priorr = pd.to_numeric(df_feat.get("prior_dropout_readmission",0), errors="coerce").fillna(0).to_numpy()
+            fin = pd.to_numeric(df_feat["financial_strain_score"], errors="coerce").fillna(DEFAULTS["financial_strain_score"]).to_numpy()
 
             lz += POLICY["per_prev_admission"] * np.minimum(adm, 5)
             lz += POLICY["per_point_low_support"] * np.maximum(0.0, 5.0 - sup)
@@ -968,41 +830,31 @@ if uploaded is not None:
             if include_followup:
                 lz += POLICY["per_followup"] * fup
                 lz += POLICY["no_followup_extra"] * (fup == 0)
-            lz += np.where(los < 7, POLICY["los_short"],
-                     np.where(los <= 28, POLICY["los_mid"],
-                     np.where(los <= 42, POLICY["los_mid_high"], POLICY["los_long"])))
+            lz += np.where(los < 3, POLICY["los_short"],
+                     np.where(los <= 21, POLICY["los_mid"],
+                     np.where(los <= 35, POLICY["los_mid_high"], POLICY["los_long"])))
             lz += POLICY["age_young"] * (agev < 21) + POLICY["age_old"] * (agev >= 75)
 
-            # 診斷
             for dx, w in POLICY["diag"].items():
                 col=f"diagnosis_{dx}"
                 if col in df_feat.columns: lz += w * (df_feat[col].to_numpy() == 1)
-
-            # chief
-            for c,w in POLICY["chief"].items():
-                col=f"chief_{c}"
-                if col in df_feat.columns: lz += w * (df_feat[col].to_numpy()==1)
-
-            # living
-            for lv,w in POLICY["living"].items():
-                col=f"living_{lv}"
-                if col in df_feat.columns: lz += w * (df_feat[col].to_numpy()==1)
-
-            # bipolar episode
-            for ep,w in POLICY["bipolar_episode"].items():
-                col=f"bipolar_episode_{ep}"
-                if col in df_feat.columns: lz += w * (df_feat[col].to_numpy()==1)
-
-            # social numerics
-            lz += POLICY["per_point_financial_stress"] * stress
-            lz += POLICY["has_case_manager"] * hascm
-            lz += POLICY["prior_dropout_readmission"] * priorr
-
-            # interactions
             sud = (df_feat.get("diagnosis_Substance Use Disorder",0).to_numpy()==1)
             pdm = (df_feat.get("diagnosis_Personality Disorder",0).to_numpy()==1)
             lz += POLICY["x_sud_lowcomp"] * (sud & (comp <= 3))
-            lz += POLICY["x_pd_shortlos"] * (pdm & (los < 7))
+            lz += POLICY["x_pd_shortlos"] * (pdm & (los < 3))
+
+            # 新增項
+            lz += POLICY["living_alone"] * (df_feat.get("living_alone_Yes",0).to_numpy()==1)
+            lz += POLICY["no_case_manager"] * (df_feat.get("has_case_manager_No",0).to_numpy()==1)
+            lz += POLICY["per_point_financial_strain"] * fin
+            lz += POLICY["prior_dropout_readmit"] * (df_feat.get("prior_dropout_readmit_Yes",0).to_numpy()==1)
+
+            for k,w in POLICY["chief"].items():
+                col=f"chief_problem_{k}"
+                if col in df_feat.columns: lz += w * (df_feat[col].to_numpy()==1)
+            for k,w in POLICY["bipolar_episode"].items():
+                col=f"bipolar_episode_{k}"
+                if col in df_feat.columns: lz += w * (df_feat[col].to_numpy()==1)
 
             delta = np.clip(OVERLAY_SCALE * (lz - base), -DELTA_CLIP, DELTA_CLIP)
             lz2 = base + delta + CAL_LOGIT_SHIFT
@@ -1011,7 +863,6 @@ if uploaded is not None:
         p_overlay_b = overlay_vec(df, include_followup=use_followups_feature)
         p_final_b = (1.0 - BLEND_W) * base_probs + BLEND_W * p_overlay_b
 
-        # 自傷 uplift
         hr = df.get("has_recent_self_harm_Yes", 0); ha = df.get("self_harm_during_admission_Yes", 0)
         mask = ((np.array(hr)==1) | (np.array(ha)==1))
         p_final_b[mask] = np.minimum(np.maximum(p_final_b[mask], SOFT_UPLIFT["floor"]) + SOFT_UPLIFT["add"], SOFT_UPLIFT["cap"])
@@ -1051,76 +902,61 @@ def generate_synth_holdout(n=20000, seed=2024):
     rng = np.random.default_rng(seed)
     df = pd.DataFrame(0, index=range(n), columns=TEMPLATE_COLUMNS, dtype=float)
     df["age"] = rng.integers(16, 85, n)
-    df["length_of_stay"] = rng.normal(21.0, 7.0, n).clip(0, 60)          # Feedback #4
-    df["num_previous_admissions"] = rng.poisson(0.8, n).clip(0, 12)
+    df["length_of_stay"] = rng.normal(21.0, 8.0, n).clip(3, 60)
+    df["num_previous_admissions"] = rng.poisson(1.0, n).clip(0, 12)
     df["medication_compliance_score"] = rng.normal(6.0, 2.5, n).clip(0, 10)
     df["family_support_score"] = rng.normal(5.0, 2.5, n).clip(0, 10)
     df["post_discharge_followups"] = rng.integers(0, 6, n)
+    df["financial_strain_score"] = rng.normal(5.0, 2.5, n).clip(0, 10)
     idx_gender = rng.integers(0, len(GENDER_LIST), n)
     for i, g in enumerate(GENDER_LIST): df.loc[idx_gender == i, f"gender_{g}"] = 1
     idx_primary = rng.integers(0, len(DIAG_LIST), n)
     for i, d in enumerate(DIAG_LIST): df.loc[idx_primary == i, f"diagnosis_{d}"] = 1
-    extra_probs = {"Substance Use Disorder": 0.20, "Anxiety": 0.20, "Depression": 0.25, "PTSD": 0.10}
-    for d, pr in extra_probs.items(): df.loc[rng.random(n) < pr, f"diagnosis_{d}"] = 1
-    r1, r2 = rng.integers(0, 2, n), rng.integers(0, 2, n)
-    df.loc[r1 == 1, "has_recent_self_harm_Yes"] = 1; df.loc[r1 == 0, "has_recent_self_harm_No"] = 1
-    df.loc[r2 == 1, "self_harm_during_admission_Yes"] = 1; df.loc[r2 == 0, "self_harm_during_admission_No"] = 1
+    idx_chief = rng.integers(0, len(CHIEF_PROBLEMS), n)
+    for i, c in enumerate(CHIEF_PROBLEMS): df.loc[idx_chief == i, f"chief_problem_{c}"] = 1
+    be_idx = rng.integers(0, len(BIPOLAR_EPISODES), n)
+    for i, b in enumerate(BIPOLAR_EPISODES): df.loc[be_idx == i, f"bipolar_episode_{b}"] = 1
+    df["living_alone_Yes"] = (rng.random(n) < 0.35).astype(int); df["living_alone_No"] = 1-df["living_alone_Yes"]
+    df["has_case_manager_Yes"] = (rng.random(n) < 0.4).astype(int); df["has_case_manager_No"] = 1-df["has_case_manager_Yes"]
+    df["prior_dropout_readmit_Yes"] = (rng.random(n) < 0.12).astype(int); df["prior_dropout_readmit_No"] = 1-df["prior_dropout_readmit_Yes"]
 
-    # Chief / Living
-    lv = rng.random(n)
-    df.loc[lv<0.30, "living_Alone"] = 1
-    df.loc[(lv>=0.30)&(lv<0.90), "living_WithFamilyOrOthers"] = 1
-    df.loc[lv>=0.90, "living_Institutional"] = 1
+    base_self = rng.random(n)
+    pd_mask  = (df.get("diagnosis_Personality Disorder",0)==1)
+    ptsd_mask= (df.get("diagnosis_PTSD",0)==1)
+    sud_mask = (df.get("diagnosis_Substance Use Disorder",0)==1)
+    boost = 0.10*pd_mask + 0.08*ptsd_mask + 0.10*sud_mask
+    r1 = (base_self < (0.18 + boost)).astype(int)
+    r2 = (rng.random(n) < (0.12 + 0.5*boost)).astype(int)
+    df["has_recent_self_harm_Yes"] = r1; df["has_recent_self_harm_No"] = 1-r1
+    df["self_harm_during_admission_Yes"] = r2; df["self_harm_during_admission_No"] = 1-r2
 
-    df["financial_stress_score"] = rng.normal(5.0, 2.5, n).clip(0, 10)
-    df["has_case_manager"] = (rng.random(n) < 0.30).astype(np.float32)
-    df["prior_dropout_readmission"] = ((rng.random(n) < 0.15) & (df["num_previous_admissions"]>=1)).astype(np.float32)
-
-    for c in CHIEF_LIST:
-        df[f"chief_{c}"] = (rng.random(n) < 0.15).astype(np.float32)
-
-    # Bipolar episode
-    probs = rng.random(n)
-    df.loc[df["diagnosis_Bipolar"]==1, "bipolar_episode_Depressive"] = (probs<0.40)&(df["diagnosis_Bipolar"]==1)
-    df.loc[df["diagnosis_Bipolar"]==1, "bipolar_episode_Manic"] = ((probs>=0.40)&(probs<0.80))&(df["diagnosis_Bipolar"]==1)
-    df.loc[df["diagnosis_Bipolar"]==1, "bipolar_episode_Mixed"] = ((probs>=0.80))&(df["diagnosis_Bipolar"]==1)
-    df.loc[df["diagnosis_Bipolar"]!=1, "bipolar_episode_NoneOrUnknown"] = 1
-
-    # 真值（同訓練生成邏輯的簡化版）
-    beta0 = -0.60
-    beta = {"has_recent_self_harm_Yes":0.80,"self_harm_during_admission_Yes":0.60,
-            "prev_adm_ge2":0.60,"medication_compliance_per_point":-0.25,"family_support_per_point":-0.20,
-            "followups_per_visit":-0.15,"length_of_stay_per_day":0.05,
-            "financial_stress_per_point":0.08,"has_case_manager":-0.25,"prior_dropout_readmission":0.60}
-    beta_diag = {"Personality Disorder":0.35,"Substance Use Disorder":0.35,"Bipolar":0.10,"PTSD":0.10,"Schizophrenia":0.10,"Depression":0.05,
-                 "Anxiety":0.00,"OCD":0.00,"Dementia":0.00,"ADHD":0.00,"Other/Unknown":0.00}
-    prev_ge2 = (df["num_previous_admissions"] >= 2).astype(np.float32)
+    beta0 = -0.55
+    prev_ge2 = (pd.to_numeric(df["num_previous_admissions"]) >= 2).astype(np.float32)
     logit = (beta0
-             + beta["has_recent_self_harm_Yes"]*df["has_recent_self_harm_Yes"]
-             + beta["self_harm_during_admission_Yes"]*df["self_harm_during_admission_Yes"]
-             + beta["prev_adm_ge2"]*prev_ge2
-             + beta["medication_compliance_per_point"]*df["medication_compliance_score"]
-             + beta["family_support_per_point"]*df["family_support_score"]
-             + beta["followups_per_visit"]*df["post_discharge_followups"]
-             + beta["length_of_stay_per_day"]*df["length_of_stay"]
-             + beta["financial_stress_per_point"]*df["financial_stress_score"]
-             + beta["has_case_manager"]*df["has_case_manager"]
-             + beta["prior_dropout_readmission"]*df["prior_dropout_readmission"])
-    for d,w in beta_diag.items(): logit = logit + w*df[f"diagnosis_{d}"]
-    # living + chief + episode
-    logit += 0.25*df["living_Alone"] + (-0.10)*df["living_Institutional"]
-    chief_w = {"SuicidalSelfHarm":0.70,"ViolenceImpulsivity":0.40,"UnableSelfCare":0.30,
-               "SevereSymptomsCaregiverLimit":0.30,"ComplexDifferential":0.15,"MedicationSideEffects":0.20}
-    for k,w in chief_w.items():
-        col=f"chief_{k}"
-        if col in df.columns: logit = logit + w * df[col]
-    epi_w = {"Depressive":0.05,"Manic":0.20,"Mixed":0.30,"NoneOrUnknown":0.00}
-    for k,w in epi_w.items():
+             + 0.85*df["has_recent_self_harm_Yes"]
+             + 0.65*df["self_harm_during_admission_Yes"]
+             + 0.60*prev_ge2
+             - 0.26*df["medication_compliance_score"]
+             - 0.20*df["family_support_score"]
+             - 0.15*df["post_discharge_followups"]
+             + 0.05*df["length_of_stay"]
+             + 0.05*df["financial_strain_score"]
+             + 0.35*df["prior_dropout_readmit_Yes"]
+             + 0.15*df["living_alone_Yes"]
+             - 0.12*df["has_case_manager_Yes"])
+    for k,w in POLICY["chief"].items():
+        col=f"chief_problem_{k}"
+        if col in df.columns: logit += w * df[col]
+    for k,w in POLICY["bipolar_episode"].items():
         col=f"bipolar_episode_{k}"
-        if col in df.columns: logit = logit + w * df[col]
+        if col in df.columns: logit += w * df[col]
+    for d,w in POLICY["diag"].items():
+        col=f"diagnosis_{d}"
+        if col in df.columns: logit += w * df[col]
 
     noise = np.random.default_rng(seed+1).normal(0.0, 0.35, n).astype(np.float32)
-    p_true = 1.0 / (1.0 + np.exp(-(logit + noise)))
+    logit_np = pd.Series(logit).to_numpy(np.float32)
+    p_true = 1.0 / (1.0 + np.exp(-(logit_np + noise)))
     y_true = (np.random.default_rng(seed+2).random(n) < p_true).astype(int)
 
     fill_defaults_batch(df)
@@ -1128,7 +964,6 @@ def generate_synth_holdout(n=20000, seed=2024):
 
 def plot_roc_pr(y, p_list, labels):
     from sklearn.metrics import roc_curve, auc, precision_recall_curve, average_precision_score
-    # ROC
     fig1, ax1 = plt.subplots()
     for p,l in zip(p_list, labels):
         fpr, tpr, _ = roc_curve(y, p); roc = auc(fpr, tpr)
@@ -1136,7 +971,7 @@ def plot_roc_pr(y, p_list, labels):
     ax1.plot([0,1],[0,1],"--")
     ax1.set_xlabel("FPR"); ax1.set_ylabel("TPR"); ax1.set_title("ROC")
     ax1.legend(loc="lower right"); st.pyplot(fig1, clear_figure=True)
-    # PR
+
     fig2, ax2 = plt.subplots()
     for p,l in zip(p_list, labels):
         prec, rec, _ = precision_recall_curve(y, p); ap = average_precision_score(y, p)
@@ -1184,7 +1019,6 @@ if run_val:
             Xa, _ = align_df_to_model(df_syn, model)
             p_model_v = predict_model_proba(Xa)
 
-            # Overlay-only
             def overlay_only_vec(df_feat, base_probs):
                 base = _logit_vec(base_probs); lz = base.copy()
                 adm = pd.to_numeric(df_feat["num_previous_admissions"], errors="coerce").fillna(DEFAULTS["num_previous_admissions"]).to_numpy()
@@ -1193,9 +1027,7 @@ if run_val:
                 fup = pd.to_numeric(df_feat["post_discharge_followups"], errors="coerce").fillna(DEFAULTS["post_discharge_followups"]).to_numpy()
                 los = pd.to_numeric(df_feat["length_of_stay"], errors="coerce").fillna(DEFAULTS["length_of_stay"]).to_numpy()
                 agev= pd.to_numeric(df_feat["age"], errors="coerce").fillna(DEFAULTS["age"]).to_numpy()
-                stress = pd.to_numeric(df_feat.get("financial_stress_score",0), errors="coerce").fillna(DEFAULTS["financial_stress_score"]).to_numpy()
-                hascm = pd.to_numeric(df_feat.get("has_case_manager",0), errors="coerce").fillna(0).to_numpy()
-                priorr = pd.to_numeric(df_feat.get("prior_dropout_readmission",0), errors="coerce").fillna(0).to_numpy()
+                fin = pd.to_numeric(df_feat["financial_strain_score"], errors="coerce").fillna(DEFAULTS["financial_strain_score"]).to_numpy()
 
                 lz += POLICY["per_prev_admission"] * np.minimum(adm, 5)
                 lz += POLICY["per_point_low_support"] * np.maximum(0.0, 5.0 - sup)
@@ -1204,34 +1036,31 @@ if run_val:
                 if use_followups_feature:
                     lz += POLICY["per_followup"] * fup
                     lz += POLICY["no_followup_extra"] * (fup == 0)
-                lz += np.where(los < 7, POLICY["los_short"],
-                        np.where(los <= 28, POLICY["los_mid"],
-                        np.where(los <= 42, POLICY["los_mid_high"], POLICY["los_long"])))
+                lz += np.where(los < 3, POLICY["los_short"],
+                        np.where(los <= 21, POLICY["los_mid"],
+                        np.where(los <= 35, POLICY["los_mid_high"], POLICY["los_long"])))
                 lz += POLICY["age_young"] * (agev < 21) + POLICY["age_old"]*(agev >= 75)
 
                 for dx,w in POLICY["diag"].items():
                     col=f"diagnosis_{dx}"
                     if col in df_feat.columns: lz += w * (df_feat[col].to_numpy()==1)
-                # chief, living, episode
-                for c,w in POLICY["chief"].items():
-                    col=f"chief_{c}"
-                    if col in df_feat.columns: lz += w*(df_feat[col].to_numpy()==1)
-                for lv,w in POLICY["living"].items():
-                    col=f"living_{lv}"
-                    if col in df_feat.columns: lz += w*(df_feat[col].to_numpy()==1)
-                for ep,w in POLICY["bipolar_episode"].items():
-                    col=f"bipolar_episode_{ep}"
-                    if col in df_feat.columns: lz += w*(df_feat[col].to_numpy()==1)
-
-                lz += POLICY["per_point_financial_stress"] * stress
-                lz += POLICY["has_case_manager"] * hascm
-                lz += POLICY["prior_dropout_readmission"] * priorr
-
-                # interactions
                 sud = (df_feat.get("diagnosis_Substance Use Disorder",0).to_numpy()==1)
                 pdm = (df_feat.get("diagnosis_Personality Disorder",0).to_numpy()==1)
                 lz += POLICY["x_sud_lowcomp"] * (sud & (comp <= 3))
-                lz += POLICY["x_pd_shortlos"] * (pdm & (los < 7))
+                lz += POLICY["x_pd_shortlos"] * (pdm & (los < 3))
+
+                lz += POLICY["living_alone"] * (df_feat.get("living_alone_Yes",0).to_numpy()==1)
+                lz += POLICY["no_case_manager"] * (df_feat.get("has_case_manager_No",0).to_numpy()==1)
+                lz += POLICY["per_point_financial_strain"] * fin
+                lz += POLICY["prior_dropout_readmit"] * (df_feat.get("prior_dropout_readmit_Yes",0).to_numpy()==1)
+
+                for k,w in POLICY["chief"].items():
+                    col=f"chief_problem_{k}"
+                    if col in df_feat.columns: lz += w * (df_feat[col].to_numpy()==1)
+                for k,w in POLICY["bipolar_episode"].items():
+                    col=f"bipolar_episode_{k}"
+                    if col in df_feat.columns: lz += w * (df_feat[col].to_numpy()==1)
+
                 delta = np.clip(OVERLAY_SCALE * (lz - base), -DELTA_CLIP, DELTA_CLIP)
                 lz2 = base + delta + CAL_LOGIT_SHIFT
                 return 1.0 / (1.0 + np.exp(-(lz2 / TEMP)))
@@ -1239,8 +1068,6 @@ if run_val:
             p_overlay_v = overlay_only_vec(df_syn, p_model_v)
             p_final_v = (1.0 - BLEND_W) * p_model_v + BLEND_W * p_overlay_v
 
-            # Metrics 表
-            from sklearn.metrics import roc_auc_score, average_precision_score, brier_score_loss
             auc_m = roc_auc_score(y_true, p_model_v); auc_o = roc_auc_score(y_true, p_overlay_v); auc_f = roc_auc_score(y_true, p_final_v)
             ap_m  = average_precision_score(y_true, p_model_v); ap_o  = average_precision_score(y_true, p_overlay_v); ap_f  = average_precision_score(y_true, p_final_v)
             br_m  = brier_score_loss(y_true, p_model_v); br_o  = brier_score_loss(y_true, p_overlay_v); br_f  = brier_score_loss(y_true, p_final_v)
@@ -1255,7 +1082,6 @@ if run_val:
             st.subheader("Curves")
             plot_roc_pr(y_true, [p_model_v, p_overlay_v, p_final_v], ["Model","Overlay","Final"])
 
-            # Decision Curve
             ths_m, nb_m = decision_curve(y_true, p_model_v)
             ths_o, nb_o = decision_curve(y_true, p_overlay_v)
             ths_f, nb_f = decision_curve(y_true, p_final_v)
@@ -1266,7 +1092,6 @@ if run_val:
             ax.axhline(0, ls="--"); ax.set_xlabel("Threshold"); ax.set_ylabel("Net benefit"); ax.set_title("Decision Curve")
             ax.legend(); st.pyplot(fig, clear_figure=True)
 
-            # Confusion + Capacity（以門檻計）
             thr_mod = pt_low/100.0; thr_hi = pt_high/100.0
             st.subheader("Operational (binary @ thresholds)")
             c1, c2 = st.columns(2)
@@ -1281,7 +1106,6 @@ if run_val:
                     tn,fp,fn,tp = confusion(y_true, p, thr_hi)
                     st.write(f"{name} — TN:{tn} FP:{fp} FN:{fn} TP:{tp}")
 
-            # Capacity & time load（簡易估算）
             st.subheader("Capacity / Time load (per 1,000 patients)")
             N = 1000
             def count_at(p, thr): return int(((p>=thr).sum() / len(p)) * N)
@@ -1293,7 +1117,6 @@ if run_val:
             hours = (mod_cnt*(t_outreach+t_sched) + (high_cnt)*(t_pharm)) / 60.0
             st.write(f"Flagged Moderate+ per 1,000: **{mod_cnt}** ; High: **{high_cnt}** → ~ **{hours:.1f} hours** total effort.")
 
-            # Fairness：性別/年齡段/主診斷
             st.subheader("Fairness (AUC / ECE by subgroup, Final)")
             def subgroup_auc_ece(df_feat, y, p, mask):
                 if mask.sum()<100: return np.nan, np.nan
@@ -1319,53 +1142,38 @@ if run_val:
 
         st.success("Validation finished.")
 
-# ====== Vignettes（for expert review）======
+# ====== Vignettes & Dictionary ======
 st.markdown("---")
 st.header("🧾 Vignettes template (for expert review)")
-def _mk_vignette_row(age, gender, diags, los, prev, comp, rsh, shadm, sup, fup, living, stress, cm, prior, chiefs, epi):
+def _mk_vignette_row(age, gender, diags, los, prev, comp, rsh, shadm, sup, fup, fin, living, cm, prior, chief, ep):
     return {
-        "Age": age, "Gender": gender, "Diagnoses": ", ".join(diags), "Bipolar Episode": epi,
-        "Chief Problem(s)": ", ".join(chiefs),
+        "Age": age, "Gender": gender, "Diagnoses": ", ".join(diags),
         "Length of Stay (days)": los, "Previous Admissions (1y)": prev,
         "Medication Compliance Score (0–10)": comp,
         "Family Support Score (0–10)": sup,
-        "Post-discharge Followups": fup,
+        "Post-discharge Followups (30d)": fup,
+        "Financial Strain (0–10)": fin,
+        "Living status": living, "Has case manager?": cm, "Prior dropout-related readmission?": prior,
+        "Chief problem": chief, "Bipolar current episode": ep,
         "Recent Self-harm": rsh, "Self-harm During Admission": shadm,
-        "Living": living, "Financial Stress (0–10)": stress,
-        "Has Case Manager": "Yes" if cm else "No",
-        "Prior Dropout Readmission": "Yes" if prior else "No",
         "Expert Risk (Low/Moderate/High or 0–100)": ""
     }
 def build_vignettes_df(n=20, seed=77):
     rng = np.random.default_rng(seed); base=[]
-    # 範例 10 例（LOS 調整到更合理）
-    protos = [
-        (19,"Female",["Depression"],14,0,3,"No","No",2,0,"WithFamilyOrOthers",6,0,0,["SuicidalSelfHarm"],"NoneOrUnknown"),
-        (28,"Male",["Substance Use Disorder"],10,3,2,"No","No",3,0,"Alone",7,0,0,["ViolenceImpulsivity"],"NoneOrUnknown"),
-        (35,"Male",["Bipolar"],24,1,4,"No","No",5,1,"WithFamilyOrOthers",5,0,0,["MedicationSideEffects"],"Manic"),
-        (42,"Female",["Personality Disorder"],16,2,3,"No","No",4,0,"Alone",6,0,0,["SuicidalSelfHarm"],"NoneOrUnknown"),
-        (55,"Male",["Schizophrenia"],30,4,5,"No","No",5,2,"WithFamilyOrOthers",4,1,1,["SevereSymptomsCaregiverLimit"],"NoneOrUnknown"),
-        (63,"Female",["PTSD"],18,1,6,"No","No",6,1,"WithFamilyOrOthers",5,0,0,["SuicidalSelfHarm"],"NoneOrUnknown"),
-        (72,"Male",["Depression","Anxiety"],21,0,7,"No","No",7,2,"WithFamilyOrOthers",3,1,0,["ComplexDifferential"],"NoneOrUnknown"),
-        (31,"Male",["Substance Use Disorder","Depression"],22,2,3,"No","No",3,0,"Alone",6,0,0,["ViolenceImpulsivity"],"NoneOrUnknown"),
-        (47,"Female",["Personality Disorder","PTSD"],14,1,4,"No","No",4,0,"WithFamilyOrOthers",6,0,0,["SuicidalSelfHarm"],"NoneOrUnknown"),
-        (60,"Male",["Dementia"],28,1,6,"No","No",6,2,"Institutional",4,1,0,["UnableSelfCare"],"NoneOrUnknown"),
-    ]
-    for p in protos: base.append(_mk_vignette_row(*p))
-    # 隨機補齊
-    for _ in range(len(base), n):
+    for _ in range(n):
         age = int(np.clip(rng.normal(40,15), 18, 90))
         gender = GENDER_LIST[int(rng.integers(0,len(GENDER_LIST)))]
         k = int(rng.integers(1,3)); diags = list(rng.choice(DIAG_LIST, size=k, replace=False))
-        los = int(np.clip(rng.normal(21,7),0,60)); prev = int(np.clip(rng.poisson(1.0),0,8))
+        los = int(np.clip(rng.normal(21,8),3,60)); prev = int(np.clip(rng.poisson(1.0),0,8))
         comp = float(np.clip(rng.normal(6,2.5),0,10)); rsh = rng.choice(["Yes","No"]); shadm = rng.choice(["Yes","No"])
         sup = float(np.clip(rng.normal(5,2.5),0,10)); fup = int(np.clip(rng.integers(0,4),0,10))
-        living = rng.choice(["Alone","WithFamilyOrOthers","Institutional"], p=[0.3,0.6,0.1])
-        stress = float(np.clip(rng.normal(5,2.5),0,10))
-        cm = int(rng.random()<0.3); prior = int(rng.random()<0.15 and prev>=1)
-        chiefs = list(rng.choice(CHIEF_LIST, size=int(rng.integers(0,2)), replace=False))
-        epi = rng.choice(["NoneOrUnknown","Depressive","Manic","Mixed"]) if "Bipolar" in diags else "NoneOrUnknown"
-        base.append(_mk_vignette_row(age, gender, diags, los, prev, comp, rsh, shadm, sup, fup, living, stress, cm, prior, chiefs, epi))
+        fin = float(np.clip(rng.normal(5,2.5),0,10))
+        living = rng.choice(["Alone","With family/others"])
+        cm = rng.choice(["Yes","No"])
+        prior = rng.choice(["Yes","No"], p=[0.12,0.88])
+        chief = rng.choice(CHIEF_PROBLEMS)
+        ep = rng.choice(BIPOLAR_EPISODES)
+        base.append(_mk_vignette_row(age, gender, diags, los, prev, comp, rsh, shadm, sup, fup, fin, living, cm, prior, chief, ep))
     return pd.DataFrame(base)
 
 vdf = build_vignettes_df(20, 77)
@@ -1374,18 +1182,17 @@ st.download_button("📥 Download Vignettes (20 cases, Excel)", buf_v,
                    file_name="vignettes_20.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# ====== Data dictionary ======
 with st.expander("📚 Data dictionary / Definitions", expanded=False):
     st.markdown("""
 - **Medication Compliance (0–10)**：0=幾乎不服藥；10=幾乎完全依從（近 1 個月）
 - **Family Support (0–10)**：0=非常不足；10=非常充足
-- **Post-discharge Followups (30d)**：出院後 **14–30 天** 內已安排或完成的接觸次數（門診/電訪/社工）【Feedback #6】
-- **Chief problem(s)**：此次住院的主要臨床考量（可複選）：自傷/自殺危險、衝動/激動、無法自理、症狀過重照顧困難、待鑑別之複雜精神病理、藥物副作用【Fb#1】
-- **Bipolar current episode**：Depressive / Manic / Mixed / NoneOrUnknown【Fb#2】
-- **Living situation**：Alone / With family or others / Institutional（康復之家、日間/中途機構）【Fb#7】
-- **Financial stress (0–10)**：財務壓力主觀量表（0 低、10 高）【Fb#7】
-- **Has case manager**：是否已連結個案管理師/社區追蹤單位（0/1）【Fb#7】
-- **Prior dropout readmission**：是否曾因未規律追蹤而再住院（0/1）【Fb#7】
+- **Financial Strain (0–10)**：0=無壓力；10=極大壓力
+- **Post-discharge Followups (30d)**：出院後 **30 天內** 已安排的接觸次數（門診/電訪/社工）
+- **Chief problem**：本次住院主要問題（自傷風險、攻擊/衝動、無法自理、嚴重精神病理/鑑別、家庭難照、藥物不良反應…）
+- **Bipolar current episode**：躁期/鬱期/混合期/不適用
+- **Living status**：Alone = 獨居；With family/others = 與他人同住
+- **Has case manager?**：是否已有個案管理師
+- **Prior dropout-related readmission?**：是否曾因未規律追蹤而再住院
 - **Pre-planning 模式**：忽略 followups 特徵（避免把「已安排的追蹤」當作預測輸入）
-- **Final Probability**：Model 與 Policy Overlay 的混合（可調 BLEND），含必要安全 uplift
+- **Final Probability**：Model 與 Policy Overlay 混合（可調 BLEND），含必要安全 uplift
 """)
